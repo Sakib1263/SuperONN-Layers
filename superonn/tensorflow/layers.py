@@ -23,6 +23,7 @@ from numbers import Integral
 from typing import Any
 
 import tensorflow as tf
+from .functional import normalize_padding, output_shape_1d
 
 
 def _positive_integer(value: int, name: str) -> int:
@@ -43,17 +44,20 @@ def _spatial_integer(value, name):
 @tf.keras.utils.register_keras_serializable(package="SuperONN")
 class _OrderAwareRegularizer(tf.keras.regularizers.Regularizer):
     """Published Frobenius sum over orders; strength is task dependent."""
-    def __init__(self, strength=0.0, decay=1.5):
+    def __init__(self, strength=0.0, decay=1.5, include_constant=False):
         self.strength, self.decay = float(strength), float(decay)
+        self.include_constant = bool(include_constant)
 
     def __call__(self, kernel):
         dtype = tf.float64 if tf.as_dtype(kernel.dtype) == tf.float64 else tf.float32
         values = tf.cast(kernel, dtype)
-        factors = tf.pow(tf.constant(self.decay, dtype), tf.cast(tf.range(tf.shape(values)[2]), dtype))
+        values = values[:, :, int(self.include_constant):, :]
+        degree = tf.range(tf.shape(values)[2])
+        factors = tf.pow(tf.constant(self.decay, dtype), tf.cast(degree, dtype))
         return tf.constant(self.strength, dtype) * tf.reduce_sum(tf.square(values) * factors[None, None, :, None])
 
     def get_config(self):
-        return {"strength": self.strength, "decay": self.decay}
+        return {"strength": self.strength, "decay": self.decay, "include_constant": self.include_constant}
 
 
 @tf.keras.utils.register_keras_serializable(package="SuperONN")
@@ -73,9 +77,10 @@ class _CombinedRegularizer(tf.keras.regularizers.Regularizer):
 class _PolynomialInitializer(tf.keras.initializers.Initializer):
     """Initialize a linear convolution, with optional independent higher orders."""
 
-    def __init__(self, initializer="glorot_uniform", initialization="linear"):
+    def __init__(self, initializer="glorot_uniform", initialization="linear", include_constant=False):
         self.initializer = tf.keras.initializers.get(initializer)
         self.initialization = initialization
+        self.include_constant = bool(include_constant)
 
     def __call__(self, shape, dtype=None):
         k, channels, q, filters = shape
@@ -83,12 +88,13 @@ class _PolynomialInitializer(tf.keras.initializers.Initializer):
             flat = self.initializer((k, channels * q, filters), dtype=dtype)
             return tf.reshape(flat, shape)
         linear = self.initializer((k, channels, filters), dtype=dtype)
-        return tf.stack([linear] + [tf.zeros_like(linear) for _ in range(q - 1)], axis=2)
+        return tf.stack([linear if i == int(self.include_constant) else tf.zeros_like(linear) for i in range(q)], axis=2)
 
     def get_config(self):
         return {
             "initializer": tf.keras.initializers.serialize(self.initializer),
             "initialization": self.initialization,
+            "include_constant": self.include_constant,
         }
 
 
@@ -140,6 +146,8 @@ def _sample_connections_1d(inputs, coordinates, channels, boundary):
         folded = tf.math.floormod(coordinates, period)
         coordinates = tf.where(folded <= last, folded, period - folded)
         coordinates = tf.where(length > 1, coordinates, tf.zeros_like(coordinates))
+    elif boundary == "circular":
+        coordinates = tf.math.floormod(coordinates, tf.cast(length, inputs.dtype))
 
     lower = tf.floor(coordinates)
     fraction = coordinates - lower
@@ -150,7 +158,7 @@ def _sample_connections_1d(inputs, coordinates, channels, boundary):
     values = tf.transpose(tf.gather(inputs, channels, axis=2), (2, 1, 0))
 
     def neighbor(index):
-        clipped = tf.clip_by_value(index, 0, length - 1)
+        clipped = tf.math.floormod(index, length) if boundary == "circular" else tf.clip_by_value(index, 0, length - 1)
         gathered = tf.gather(values, tf.transpose(clipped, (2, 0, 1)), axis=1, batch_dims=1)
         gathered = tf.transpose(gathered, (3, 1, 2, 0))
         if boundary == "zeros":
@@ -166,10 +174,12 @@ def _sample_connections_1d(inputs, coordinates, channels, boundary):
 class SuperONN1D(tf.keras.layers.Layer):
     """Polynomial spectral convolution with fixed or learnable kernel locations.
 
-    Input/output layout is [batch, bins, channels]. ``groups`` partitions original
+    Default layout is [batch, bins, channels]; channels_first is also supported.
+    ``groups`` partitions original
     input channels, with both channels and filters divisible by groups. Kernel
-    state has shape [kernel_size, input_channels/groups, q, filters]. No q=0
-    constant basis is used; optional bias is one scalar per output channel.
+    state has shape [kernel_size, input_channels/groups, orders, filters]. An
+    optional constant basis increases orders from q to q+1. Bias is one scalar
+    per output channel. Numeric padding or Keras same/valid sizing is supported.
 
     ``random_fixed`` uses nontrainable integer shifts initialized uniformly once.
     ``learned`` uses continuous shifts ``max_shift*tanh(shift_parameter)`` with a
@@ -187,6 +197,9 @@ class SuperONN1D(tf.keras.layers.Layer):
     or coefficients. Shared mode uses channel-major polynomial expansion and
     native valid convolutions on an explicitly sampled extended source grid.
     """
+
+    spatial_rank = 1
+    transposed = False
 
     def __init__(
         self,
@@ -219,30 +232,34 @@ class SuperONN1D(tf.keras.layers.Layer):
         bias_regularizer=None,
         kernel_constraint=None,
         bias_constraint=None,
+        include_constant=False,
+        data_format="channels_last",
         **kwargs,
     ):
         super().__init__(autocast=False, **kwargs)
         self.filters = _positive_integer(filters, "filters")
         self.kernel_size = _spatial_integer(kernel_size, "kernel_size")
         self.q = _positive_integer(q, "q")
+        self.include_constant = bool(include_constant)
+        self.orders = self.q + int(self.include_constant)
+        if data_format not in ("channels_last", "channels_first"):
+            raise ValueError("Invalid data_format")
+        self.data_format = data_format
         self.strides = _spatial_integer(strides, "strides")
         self.dilation_rate = _spatial_integer(dilation_rate, "dilation_rate")
         self.groups = _positive_integer(groups, "groups")
         self.output_chunk_size = _positive_integer(output_chunk_size, "output_chunk_size")
-        if padding not in {"same", "valid"}:
-            raise ValueError("padding must be 'same' or 'valid'")
+        padding = normalize_padding(padding, 1)
         if shift_mode not in {"random_fixed", "learned"}:
             raise ValueError("shift_mode must be 'random_fixed' or 'learned'")
         if shift_sharing not in {"shared", "full"}:
             raise ValueError("shift_sharing must be 'shared' or 'full'")
-        if boundary not in {"zeros", "border", "reflection"}:
-            raise ValueError("boundary must be 'zeros', 'border', or 'reflection'")
+        if boundary not in {"zeros", "border", "reflection", "circular"}:
+            raise ValueError("boundary must be zeros, border, reflection, or circular")
         if initialization not in {"linear", "all_orders"}:
             raise ValueError("initialization must be 'linear' or 'all_orders'")
         if isinstance(max_shift, bool) or not math.isfinite(float(max_shift)) or max_shift < 0:
             raise ValueError("max_shift must be finite and nonnegative")
-        if shift_mode == "random_fixed" and not float(max_shift).is_integer():
-            raise ValueError("random_fixed max_shift must be an integer number of bins")
         if seed is not None and (isinstance(seed, bool) or not isinstance(seed, Integral)):
             raise ValueError("seed must be an integer or None")
         shift_initializer = shift_initializer or ("random" if shift_mode == "random_fixed" else "zeros")
@@ -277,7 +294,7 @@ class SuperONN1D(tf.keras.layers.Layer):
             raise ValueError("order_regularization must be finite and nonnegative")
         if isinstance(order_decay, bool) or not math.isfinite(order_decay) or order_decay < 1:
             raise ValueError("order_decay must be finite and >= 1")
-        self.input_bound = input_bound
+        self.input_bound = None if input_bound is None else float(input_bound)
         self.order_regularization, self.order_decay = float(order_regularization), float(order_decay)
         self.activation = tf.keras.activations.get(activation)
         self.bias_initializer = tf.keras.initializers.get(bias_initializer)
@@ -290,7 +307,7 @@ class SuperONN1D(tf.keras.layers.Layer):
     def _coefficient_regularizer(self):
         items = [self.kernel_regularizer] if self.kernel_regularizer is not None else []
         if self.order_regularization:
-            items.append(_OrderAwareRegularizer(self.order_regularization, self.order_decay))
+            items.append(_OrderAwareRegularizer(self.order_regularization, self.order_decay, self.include_constant))
         return _CombinedRegularizer(items) if len(items) > 1 else (items[0] if items else None)
 
     @property
@@ -299,18 +316,19 @@ class SuperONN1D(tf.keras.layers.Layer):
 
     def build(self, input_shape):
         shape = tf.TensorShape(input_shape)
-        if shape.rank != 3 or shape[-1] is None:
-            raise ValueError("SuperONN1D requires [batch,bins,channels] with known channels")
-        self.input_channels = int(shape[-1])
+        channel_axis = -1 if self.data_format == "channels_last" else 1
+        if shape.rank != 3 or shape[channel_axis] is None:
+            raise ValueError("SuperONN1D requires rank 3 with known channels")
+        self.input_channels = int(shape[channel_axis])
         if self.input_channels < 1 or self.input_channels % self.groups:
             raise ValueError("input channels must be positive and divisible by groups")
         self.channels_per_group = self.input_channels // self.groups
         self.filters_per_group = self.filters // self.groups
-        self.input_spec = tf.keras.layers.InputSpec(ndim=3, axes={-1: self.input_channels})
+        self.input_spec = tf.keras.layers.InputSpec(ndim=3, axes={channel_axis: self.input_channels})
         self.kernel = self.add_weight(
             name="kernel",
-            shape=(self.kernel_size, self.channels_per_group, self.q, self.filters),
-            initializer=_PolynomialInitializer(self.kernel_initializer, self.initialization),
+            shape=(self.kernel_size, self.channels_per_group, self.orders, self.filters),
+            initializer=_PolynomialInitializer(self.kernel_initializer, self.initialization, self.include_constant),
             regularizer=self._coefficient_regularizer(),
             constraint=self.kernel_constraint,
             dtype=self.variable_dtype,
@@ -337,7 +355,8 @@ class SuperONN1D(tf.keras.layers.Layer):
         """Current offsets in input-feature bins, with no dummy axis or rounding."""
         parameter = tf.cast(self.shift_parameter, self.stable_dtype)
         if self.shift_mode == "random_fixed":
-            return tf.round(tf.clip_by_value(parameter, -self.max_shift, self.max_shift))
+            limit = math.floor(self.max_shift)
+            return tf.round(tf.clip_by_value(parameter, -limit, limit))
         return tf.constant(self.max_shift, self.stable_dtype) * tf.tanh(parameter)
 
     def _output_grid(self, length):
@@ -347,8 +366,8 @@ class SuperONN1D(tf.keras.layers.Layer):
             total_padding = tf.maximum((count - 1) * self.strides + effective_kernel - length, 0)
             left = total_padding // 2
         else:
-            count = (length - effective_kernel) // self.strides + 1
-            left = tf.constant(0, tf.int32)
+            left = tf.constant(0 if self.padding == "valid" else self.padding, tf.int32)
+            count = (length + 2 * left - effective_kernel) // self.strides + 1
         tf.debugging.assert_positive(count, message="valid kernel must fit the spectral input")
         return count, left, effective_kernel
 
@@ -363,28 +382,28 @@ class SuperONN1D(tf.keras.layers.Layer):
             channels = tf.range(self.input_channels)
             coords = position[:, None, None] + tf.reshape(shifts, (1, 1, self.input_channels))
             sampled = _sample_connections_1d(inputs, coords, channels, self.boundary)[:, :, 0, :]
-            powers = []
+            powers = [tf.ones_like(sampled)] if self.include_constant else []
             power = sampled
             for degree in range(self.q):
                 if degree:
                     power = power * sampled
                 powers.append(power)
-            basis = tf.reshape(tf.stack(powers, axis=-1), (tf.shape(inputs)[0], 1, extent, self.input_channels * self.q))
+            basis = tf.reshape(tf.stack(powers, axis=-1), (tf.shape(inputs)[0], 1, extent, self.input_channels * self.orders))
             multiplier = self.filters_per_group
-            weights = tf.reshape(kernel[:, 0, :, :], (self.kernel_size, self.q, self.input_channels, multiplier))
-            weights = tf.reshape(tf.transpose(weights, (0, 2, 1, 3)), (1, self.kernel_size, self.input_channels * self.q, multiplier))
+            weights = tf.reshape(kernel[:, 0, :, :], (self.kernel_size, self.orders, self.input_channels, multiplier))
+            weights = tf.reshape(tf.transpose(weights, (0, 2, 1, 3)), (1, self.kernel_size, self.input_channels * self.orders, multiplier))
             result = tf.nn.depthwise_conv2d(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
-                                          strides=(1, 1, 1, 1), padding="VALID", dilations=(1, self.dilation_rate))
+                                          strides=(1, 1, 1, 1), padding="VALID", dilations=(1, self.dilation_rate), data_format="NHWC")
             result = tf.cast(result, self.stable_dtype)
             result = tf.squeeze(result, axis=1)[:, ::self.strides, :]
-            result = tf.reshape(result, (tf.shape(inputs)[0], count, self.input_channels, self.q, multiplier))
+            result = tf.reshape(result, (tf.shape(inputs)[0], count, self.input_channels, self.orders, multiplier))
             return tf.reshape(tf.reduce_sum(result, axis=3), (tf.shape(inputs)[0], count, self.filters))
         outputs = []
         for group in range(self.groups):
             channels = tf.range(group * self.channels_per_group, (group + 1) * self.channels_per_group)
             coords = position[:, None, None] + shifts[group][None, None, :]
             sampled = _sample_connections_1d(inputs, coords, channels, self.boundary)[:, :, 0, :]
-            powers = []
+            powers = [tf.ones_like(sampled)] if self.include_constant else []
             power = sampled
             for degree in range(self.q):
                 if degree:
@@ -392,13 +411,13 @@ class SuperONN1D(tf.keras.layers.Layer):
                 powers.append(power)
             # [N,E,I,Q] makes each original channel's powers contiguous, which
             # preserves group/depthwise semantics instead of grouping by power.
-            basis = tf.reshape(tf.stack(powers, axis=-1), (tf.shape(inputs)[0], extent, self.channels_per_group * self.q))
+            basis = tf.reshape(tf.stack(powers, axis=-1), (tf.shape(inputs)[0], extent, self.channels_per_group * self.orders))
             start, end = group * self.filters_per_group, (group + 1) * self.filters_per_group
-            weights = tf.reshape(kernel[:, :, :, start:end], (self.kernel_size, self.channels_per_group * self.q, self.filters_per_group))
+            weights = tf.reshape(kernel[:, :, :, start:end], (self.kernel_size, self.channels_per_group * self.orders, self.filters_per_group))
             # Compute unit stride then slice so simultaneous stride+dilation is
             # defined without relying on a backend-specific convolution limit.
-            result = tf.nn.conv1d(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
-                                  stride=1, padding="VALID", dilations=self.dilation_rate)
+            result = tf.nn.convolution(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
+                                      padding="VALID", dilations=(self.dilation_rate,), data_format="NWC")
             result = tf.cast(result, self.stable_dtype)
             outputs.append(result[:, ::self.strides, :])
         return tf.concat(outputs, axis=-1)
@@ -408,11 +427,11 @@ class SuperONN1D(tf.keras.layers.Layer):
         for tap in range(self.kernel_size):
             coords = positions[:, None, None] + tf.cast(tap * self.dilation_rate, self.stable_dtype) + shifts[None, :, :]
             sampled = _sample_connections_1d(inputs, coords, channels, self.boundary)
-            polynomial = tf.transpose(kernel[tap, :, self.q - 1, :])[None, None, :, :]
-            for degree in range(self.q - 2, -1, -1):
+            polynomial = tf.transpose(kernel[tap, :, self.orders - 1, :])[None, None, :, :]
+            for degree in range(self.orders - 2, -1, -1):
                 coefficient = tf.transpose(kernel[tap, :, degree, :])[None, None, :, :]
                 polynomial = polynomial * sampled + coefficient
-            result = result + tf.reduce_sum(polynomial * sampled, axis=-1)
+            result = result + tf.reduce_sum(polynomial if self.include_constant else polynomial * sampled, axis=-1)
         return result
 
     def _operation(self, inputs, kernel, shifts, bias):
@@ -460,6 +479,8 @@ class SuperONN1D(tf.keras.layers.Layer):
         return tf.cast(self.activation(result), self.compute_dtype)
 
     def call(self, inputs):
+        if self.data_format == "channels_first":
+            inputs = tf.transpose(inputs, (0, 2, 1))
         # Explicit tensor arguments prevent Keras' stateless shape-inference
         # scope from being captured as frozen weights/offsets by tf.function.
         # Real calls always read the current variables outside the XLA cluster.
@@ -469,17 +490,15 @@ class SuperONN1D(tf.keras.layers.Layer):
             # Validate length outside the optional XLA cluster as well. XLA
             # may discard Assert nodes inside a compiled cluster.
             tf.debugging.assert_positive(tf.shape(inputs)[1], message="spectral length must be positive")
-            return self._compiled_operation(*args)
-        return self._operation(*args)
+            self._output_grid(tf.shape(inputs)[1])
+            result = self._compiled_operation(*args)
+        else:
+            result = self._operation(*args)
+        return tf.transpose(result, (0, 2, 1)) if self.data_format == "channels_first" else result
 
     def compute_output_shape(self, input_shape):
-        length = input_shape[1]
-        if length is not None:
-            kernel = (self.kernel_size - 1) * self.dilation_rate + 1
-            length = (length + self.strides - 1) // self.strides if self.padding == "same" else (length - kernel) // self.strides + 1
-            if length < 1:
-                raise ValueError("valid kernel must fit the spectral input")
-        return tf.TensorShape((input_shape[0], length, self.filters))
+        return output_shape_1d(input_shape, self.filters, self.kernel_size, self.strides,
+                               self.padding, self.dilation_rate, self.data_format)
 
     def get_config(self):
         return {
@@ -487,6 +506,8 @@ class SuperONN1D(tf.keras.layers.Layer):
             "filters": self.filters,
             "kernel_size": self.kernel_size,
             "q": self.q,
+            "include_constant": self.include_constant,
+            "data_format": self.data_format,
             "strides": self.strides,
             "padding": self.padding,
             "dilation_rate": self.dilation_rate,

@@ -1,7 +1,7 @@
 """Reusable operators with lazy loading of the optional framework backends."""
 from .presets import SuperONNConfig, superonn_regularization_loss
 
-__version__ = "0.3.1"
+__version__ = "0.5.1"
 __all__ = ["SuperONN1d", "SuperONN2d", "SuperONNTranspose1d", "SuperONNTranspose2d", "SuperONNConfig", "superonn_regularization_loss"]
 
 

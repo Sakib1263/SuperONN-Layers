@@ -15,9 +15,14 @@ def sample_nd(x, coordinates, ndim, mode="zeros"):
         raise ValueError("Sampling coordinates do not match input leading dimensions")
     coords = list(coordinates.unbind(axis))
     if mode == "replicate":
-        coords = [c.clamp(0, n - 1) for c, n in zip(coords, spatial)]
+        # Specify the endpoint subgradient explicitly: clamp's boundary rule
+        # differs between framework versions. Keep the in-domain one-sided
+        # derivative, with identical clipped neighbors at the upper endpoint.
+        coords = [torch.where(c > n - 1, torch.full_like(c, n - 1),
+                              torch.where(c < 0, torch.zeros_like(c), c))
+                  for c, n in zip(coords, spatial)]
     elif mode == "reflect":
-        coords = [torch.zeros_like(c) if n == 1 else
+        coords = [c * 0 if n == 1 else
                   (n - 1) - (torch.remainder(c, 2 * (n - 1)) - (n - 1)).abs()
                   for c, n in zip(coords, spatial)]
     elif mode == "circular":
@@ -41,7 +46,7 @@ def sample_nd(x, coordinates, ndim, mode="zeros"):
             coefficient = coefficient * (fraction if bit else 1 - fraction)
             if mode == "circular":
                 cell = cell.remainder(size)
-            else:
+            elif mode == "zeros":
                 valid = valid & (cell >= 0) & (cell < size)
             index = index + cell.clamp(0, size - 1) * step
         values = flat.gather(-1, index.reshape(*lead, math.prod(output))).reshape(*lead, *output)

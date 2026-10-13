@@ -58,14 +58,14 @@ class _SuperONN(nn.Module):
                 raise ValueError("Forward padding strings must be 'same' or 'valid'")
             if padding == "same" and any(s != 1 for s in self.stride):
                 raise ValueError("padding='same' requires stride=1, as in torch Conv")
-            self.padding = padding
+            self.padding = str(padding)
         else:
             self.padding = _tuple(padding, d, "padding", 0)
         if padding_mode not in ("zeros", "reflect", "replicate", "circular"):
             raise ValueError("Invalid padding_mode")
         if self.transposed and padding_mode != "zeros":
             raise ValueError("Transpose layers support padding_mode='zeros'")
-        self.padding_mode = padding_mode
+        self.padding_mode = str(padding_mode)
         self.output_padding = _tuple(output_padding, d, "output_padding", 0)
         if not self.transposed and any(self.output_padding):
             raise ValueError("output_padding belongs to transpose layers")
@@ -80,7 +80,7 @@ class _SuperONN(nn.Module):
             raise ValueError("shift_mode must be 'learned' or 'random_fixed'")
         if shift_sharing not in ("shared", "full"):
             raise ValueError("shift_sharing must be 'shared' or 'full'")
-        self.shift_mode, self.shift_sharing = shift_mode, shift_sharing
+        self.shift_mode, self.shift_sharing = str(shift_mode), str(shift_sharing)
         limits = (max_shift,) * d if isinstance(max_shift, Real) else tuple(max_shift)
         if len(limits) != d or any(isinstance(v, bool) or not isinstance(v, Real) or not math.isfinite(v) or v < 0 for v in limits):
             raise ValueError("max_shift must contain finite nonnegative numbers")
@@ -92,7 +92,8 @@ class _SuperONN(nn.Module):
             raise ValueError("Unknown initialization")
         if input_bound is not None and (isinstance(input_bound, bool) or not isinstance(input_bound, Real) or not math.isfinite(input_bound) or input_bound <= 0):
             raise ValueError("input_bound must be positive and finite")
-        self.shift_init, self.initialization, self.input_bound = shift_init, initialization, input_bound
+        self.shift_init, self.initialization = str(shift_init), str(initialization)
+        self.input_bound = None if input_bound is None else float(input_bound)
         self.output_chunk_size = _integer(output_chunk_size, "output_chunk_size")
         self.recompute = bool(recompute)
         if conv_precision not in ("stable", "autocast"):
@@ -173,7 +174,17 @@ class _SuperONN(nn.Module):
                     offsets[..., axis].random_(-math.floor(span), math.floor(span) + 1)
                 else:
                     offsets[..., axis].uniform_(-span, span)
-            self.set_shifts_(offsets)
+            # Generated offsets already obey the initialization contract.
+            # Avoid value-dependent validation here: meta tensors have no
+            # values yet, and concrete device initialization needs no sync.
+            if self.raw_shifts is None:
+                self.fixed_shifts.copy_(offsets)
+            else:
+                limits = offsets.new_tensor(self.max_shift)
+                ratio = offsets / limits.clamp_min(torch.finfo(offsets.dtype).tiny)
+                eps = torch.finfo(self.raw_shifts.dtype).eps
+                self.raw_shifts.copy_(torch.atanh(ratio.clamp(-1 + eps, 1 - eps)))
+            self.shift_limits.copy_(self.shift_limits.new_tensor(self.max_shift))
 
     def _config(self):
         return {"format": 1, "layout": "output,input,order,kernel", "spatial_rank": self.spatial_rank,

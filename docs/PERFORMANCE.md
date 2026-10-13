@@ -7,12 +7,20 @@ This guide covers execution controls, observed timings, and common setup issues.
 | API | Locally verified versions | Coverage |
 |---|---|---|
 | PyTorch | 2.6.0+cu126 and 2.14.1+cu126 | 1D/2D forward and transpose, eager/compiled execution, gradients, AMP, and checkpoints |
-| TensorFlow/Keras | TensorFlow 2.21.0; Keras 3.15.0 and 3.15.1 | 1D grouped/depthwise/separable layers, eager/graph execution, XLA, gradients, and serialization |
+| TensorFlow/Keras | TensorFlow 2.21.0; Keras 3.15.0 and 3.15.1 | 1D/2D forward/transpose, grouped layers and 1D depthwise/separable compositions, eager/graph/XLA training, gradients, mixed precision, and serialization |
 | Python | 3.13.14 | Local CPU and CUDA checks |
 
-The GitHub Actions workflow is configured for Python 3.11/3.13 with PyTorch 2.6.0/2.14.1, plus Python 3.13 with TensorFlow 2.21.0/Keras 3.15.1. Remote CI results become available after the repository is published and the workflow runs.
+The GitHub Actions release workflow builds/checks distributions, verifies framework-free metadata, and checks installed backend APIs. Backend jobs use Python 3.11/3.13 with PyTorch 2.6.0/2.14.1, plus Linux/Windows/macOS CPU jobs with Python 3.13 and TensorFlow 2.21.0/Keras 3.15.1. Remote CI results become available after the repository is published and the workflow runs.
 
-The package supports the tested paths above. ONNX export, distributed execution, MPS/XPU, other GPUs, and combinations outside the tested matrix require their own checks.
+The package supports the tested paths above. ONNX export, multi-host/GPU distributed execution, MPS/XPU, other GPUs, and combinations outside the tested matrix require their own checks.
+
+Additional lifecycle checks use PyTorch 2.14.1 and TensorFlow 2.21.0/Keras
+3.15.1 on Linux CPU: optimizer resume, functional/stateless calls, independent
+SavedModel serving, dynamic-batch PyTorch export, and synchronous two-CPU
+training. PyTorch meta construction/materialization passes on 2.6.0/2.14.1 CPU
+and 2.14.1 CUDA. Compiled TensorFlow operators also accept supplied stateless
+weights after tracing. These checks are scoped workflows, not deployment or
+distributed-runtime benchmarks.
 
 ## Choosing execution controls
 
@@ -24,32 +32,31 @@ The package supports the tested paths above. ONNX export, distributed execution,
 
 Polynomial degree, sharing layout, offset range, and grouping affect the model's function. Changing them for speed also changes the architecture. Compare execution controls using identical model settings and weights.
 
-## Measured operator timings
+## Measuring your workload
 
-Measurements were made on **13 October 2026**, using an **NVIDIA RTX 3080 Ti Laptop GPU** and Python 3.13.14. The synthetic workload had batch size 2, 8 input/output channels, length 1400, kernel size 7, polynomial degree 3, full learned offsets, input bounding, and recomputation enabled. The depthwise workload used 8 groups.
+Record the library/framework versions, hardware, batch size, input shape,
+channel width, polynomial degree, groups, offset mode/sharing, and precision.
+Use identical weights and model settings when comparing execution controls.
 
-Three warmup passes preceded seven timed forward/backward passes. Timings below exclude compilation from steady-state execution. Reference and compiled paths used the same weights within each framework; outputs and input/coefficient/offset gradients were checked for numerical agreement.
+Warm up the runtime and synchronize the device around GPU measurements. Report
+first-call compilation latency separately from steady-state forward/backward
+time. Include the measurement count, median and spread, and activation-memory
+measurement method. New shapes may trigger new compilation.
 
-| Framework/workload | Reference | Compiled | Observed speedup | First compiled call |
-|---|---:|---:|---:|---:|
-| PyTorch 2.14.1, dense | 46.57 ms eager | 3.02 ms Inductor | 15.4x | 41.0 s |
-| TensorFlow 2.21 / Keras 3.15.1, dense | 57.46 ms graph | 1.68 ms XLA training function | 34.2x | 10.2 s |
-| PyTorch 2.14.1, depthwise | 4.71 ms eager | 1.11 ms Inductor | 4.2x | 0.8 s |
-| TensorFlow 2.21 / Keras 3.15.1, depthwise | 5.68 ms graph | 2.18 ms XLA training function | 2.6x | 1.4 s |
+Shared and full offsets define different models, so their timing difference
+is an architecture tradeoff. Chunking, recomputation, and compilation can be
+compared while preserving the mathematical settings. Validate the actual
+workload before relying on reduced precision or a compiler speedup.
 
-TensorFlow timings compare operator training functions, rather than complete application models. Operator-level XLA inside an ordinary graph measured approximately 2.49 ms dense and 2.32 ms depthwise. An eager outer gradient tape has a different overhead profile.
-
-PyTorch's compiled incremental activation peak was approximately 10.4 MB dense and 0.72 MB depthwise, versus 40.4 MB and 1.97 MB eager. These are incremental allocator measurements, not total process or model memory.
-
-These measurements describe one short workload. They are not universal speed guarantees, accuracy comparisons, or long-run thermal measurements. First calls may benefit from persistent compiler caches and are not guaranteed cold-cache measurements. Device, batch size, width, shape changes, determinism settings, and compiler versions all affect results.
-
-To assess your model, time synchronized forward/backward steps after warmup, report first-call latency separately, use identical weights and settings, and compare outputs and gradients before interpreting speedups. Runnable training examples provide starting points for a representative workload.
+The training examples provide starting models for such measurements. Historical
+timings from older releases have been removed from this guide; they do not
+establish the performance of the current 2D/transpose implementations.
 
 ## Common issues
 
 ### Input shape or channel mismatch
 
-PyTorch expects `[batch, channels, length]` or `[batch, channels, height, width]`; its unbatched equivalents are also accepted. Keras expects `[batch, length, channels]`. Keras needs the channel count to be known when the layer is built. Both input and output channel counts must be divisible by `groups`.
+PyTorch expects `[batch, channels, length]` or `[batch, channels, height, width]`; its unbatched equivalents are also accepted. Keras cores and 1D depthwise/separable compositions default to `[batch, length, channels]` or `[batch, height, width, channels]`; `data_format="channels_first"` is also supported. Keras needs the channel count to be known when the layer is built. Both input and output channel counts must be divisible by `groups`.
 
 ### Large values or unstable higher-order terms
 
@@ -67,6 +74,25 @@ Reconstruct the same architecture, polynomial degree, offset mode, sharing layou
 
 For Keras, import `superonn.tensorflow` before loading a `.keras` file in a new process. Custom third-party activations, regularizers, and constraints need their own registrations. Checkpoints from unrelated implementations require explicit conversion.
 
-### TensorFlow tests cannot run
+### Missing backend or runtime resources
 
-Install the TensorFlow and test extras. The optional test file skips when TensorFlow is absent; its XLA cases still require a working CPU XLA runtime when it is installed. Limit TensorFlow thread counts on constrained systems if the runtime cannot create its worker threads.
+Install the selected backend extra (`[torch]` or `[tensorflow]`) in the same environment that runs your model. Install both for layer conversion. XLA needs a working compiler runtime. Limit TensorFlow thread counts on constrained systems if the runtime cannot create its worker threads.
+
+
+## Nested input-gradient penalties
+
+TensorFlow input-gradient penalties, such as R1/gradient penalties, require
+`recompute=False` in every participating core or composition. The installed
+TensorFlow rematerialization API rejects the tested nested derivatives. With
+recomputation disabled, output/input/coefficient/offset derivatives of these
+penalties are checked against PyTorch for all four classes, both sharing
+layouts, and grouped/depthwise connectivity. Saved activation memory increases.
+
+The implementation supplies explicit native convolution data formats so 2D
+shared/depthwise second derivatives avoid a missing-attribute error. This is
+independent of the public channels-first/channels-last tensor layout.
+
+The TensorFlow namespace checks the selected Keras backend and requires
+`KERAS_BACKEND=tensorflow` before Keras is imported. Other Keras backends use
+different tensor/variable systems; use the native PyTorch namespace for
+PyTorch models.

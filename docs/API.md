@@ -78,14 +78,27 @@ Coefficients have shape `[Cout, Cin/groups, Q, *kernel]`, where `Q=q+1` with a c
 
 ```python
 from superonn.tensorflow import (
-    SuperONN1D, SuperONNBlock1D,
+    SuperONN1D, SuperONN2D, SuperONNTranspose1D, SuperONNTranspose2D,
+    SuperONNBlock1D,
     DepthwiseSuperONN1D, SeparableSuperONN1D,
-    conv1d, depthwise_conv1d, separable_conv1d,
+    conv1d, conv2d, conv_transpose1d, conv_transpose2d,
+    depthwise_conv1d, separable_conv1d,
     model_regularization_loss,
 )
 ```
 
-All Keras operators require `[N, L, Cin]` inputs with known positive channel counts when built. `SuperONN1D` produces `[N, Lout, filters]`.
+Core Keras layers require batched inputs with known positive channel counts
+when built. `data_format="channels_last"` is the default; `"channels_first"`
+transposes into native channels-last computation internally for CPU portability.
+1D depthwise/separable compositions also support both layouts; the residual
+block retains its channels-last interface.
+
+| Layer | Default input | Default output | Default padding |
+|---|---|---|---|
+| `SuperONN1D` | `[N,L,Cin]` | `[N,Lout,filters]` | `"same"` |
+| `SuperONN2D` | `[N,H,W,Cin]` | `[N,Hout,Wout,filters]` | `"same"` |
+| `SuperONNTranspose1D` | `[N,L,Cin]` | `[N,Lout,filters]` | `"valid"` |
+| `SuperONNTranspose2D` | `[N,H,W,Cin]` | `[N,Hout,Wout,filters]` | `"valid"` |
 
 ```python
 SuperONN1D(
@@ -94,7 +107,8 @@ SuperONN1D(
     shift_mode="learned", shift_sharing="full", max_shift=2.0,
     shift_initializer=None, use_bias=True, kernel_initializer="glorot_uniform",
     initialization="linear", boundary="zeros", output_chunk_size=4,
-    recompute=True, seed=None, input_bound=None,
+    recompute=True, seed=None, input_bound=None, include_constant=False,
+    data_format="channels_last",
     order_regularization=0.0, order_decay=1.5,
     conv_precision="stable", jit_compile=False, activation=None,
     bias_initializer="zeros", kernel_regularizer=None, bias_regularizer=None,
@@ -104,12 +118,39 @@ SuperONN1D(
 
 Keras-specific details:
 
-- `kernel_size`, `strides`, and `dilation_rate` accept integers or one-element tuples.
-- Padding is `"same"` or `"valid"`; boundary is `"zeros"`, `"border"`, or `"reflection"`.
+- `kernel_size`, `strides`, and `dilation_rate` accept scalar integers or tuples matching spatial rank. Both stride and dilation can exceed one; the shared path uses a unit-stride native convolution then slices the output.
+- Forward padding is `"same"`, `"valid"`, or nonnegative symmetric per-axis integers. Boundaries are `"zeros"`, `"border"`, `"reflection"`, or `"circular"`. Transpose requires `boundary="zeros"`.
 - `initialization` accepts `"linear"` and `"all_orders"`. `shift_initializer` accepts `"zeros"` and `"random"`, with the same mode-dependent default as PyTorch.
-- Fixed mode requires an integer `max_shift`. `seed` optionally seeds offset initialization; use ordinary Keras random-seed controls for the whole model.
-- Coefficients use the Keras layout `[kernel_size, Cin/groups, q, filters]`. Raw learned offsets or fixed offsets are stored in `shift_parameter`; call `effective_shifts()` to inspect effective offsets.
+- `max_shift` is a finite nonnegative scalar or a per-axis 2D tuple. Fixed offsets are sampled from integer bins within `floor(max_shift)`. `seed` optionally seeds offset initialization; use ordinary Keras random-seed controls for the whole model.
+- Coefficients use `[*kernel, Cin/groups, orders, filters]`, where `orders=q+int(include_constant)`. Constant bases are allowed in forward layers. Raw learned offsets or fixed offsets are stored in `shift_parameter`; call `effective_shifts()` to inspect them. Full offsets use `[filters,Cin/groups,rank]` and shared offsets use `[groups,Cin/groups,rank]`. The existing `SuperONN1D` retains its compatible offset layout without the trailing size-one rank axis.
 - The API uses TensorFlow operations and TensorFlow compilation. Other Keras backends are outside its supported scope.
+
+### 2D and transposed constructors
+
+`SuperONN2D(filters, kernel_size, ...)` accepts the same common arguments as
+`SuperONN1D`, with two spatial axes. The transpose classes add
+`output_padding=None`; their default `padding="valid"` follows Keras.
+All four classes support ordinary `build`, `get_config`, `.keras` saving,
+mixed precision, `tf.function`, and optional XLA.
+
+Let `n` be an input size, `s` its stride, and `k=(kernel_size-1)*dilation+1`:
+
+| Transpose padding | Output size per axis |
+|---|---|
+| Numeric `p` | `(n-1)*s - 2*p + k + op`, with omitted `op=0` |
+| `"valid"`, `output_padding=None` | `(n-1)*s + max(k,s)` |
+| `"valid"`, explicit `op` | `(n-1)*s + k + op` |
+| `"same"`, `output_padding=None` | `n*s` |
+| `"same"`, explicit `op` | `(n-1)*s + k%2 + op` |
+
+Explicit `output_padding` must be nonnegative and smaller than stride for
+Keras string padding. Numeric padding follows PyTorch and permits values
+smaller than stride **or** dilation. Transpose constant bases are rejected;
+use bias. Kernel layout remains `[*kernel,Cin/groups,q,filters]` in both
+directions; it differs from a conventional Keras ConvTranspose kernel layout.
+
+Use [conversion helpers](INTEROPERABILITY.md) for native cross-framework state
+transfer, including layout handling and exact-padding restrictions.
 
 ### Compositions and interchangeable factories
 
@@ -126,7 +167,16 @@ layer = conv1d(
 )
 ```
 
-Factory options can be supplied in the `superonn` mapping or as recognized SuperONN keyword arguments. Direct keyword arguments take precedence. The factories apply the shared bounded defaults in `SUPERONN_DEFAULTS`, including `input_bound=1`, and reject unknown mapping keys. Depthwise/separable constructors also use that preset. `jit_compile` defaults to `False`.
+`conv2d`, `conv_transpose1d`, and `conv_transpose2d` select the corresponding
+standard Keras layer or native operational class. Defaults are those of the
+selected class; supply explicit padding to preserve a desired architecture shape.
+The conventional Keras transpose classes do not support SuperONN's grouped
+transpose extension.
+
+Factory options can be supplied in the `superonn` mapping or as recognized SuperONN keyword arguments. Direct keyword arguments take precedence. The factories apply the shared bounded defaults in `SUPERONN_DEFAULTS`, including `input_bound=1`, and reject unknown mapping keys. Depthwise/separable constructors also use that preset. Optional `seed`,
+`shift_initializer`, `boundary`, and `include_constant` settings are supported
+in mappings or factory keyword arguments. Two-dimensional factories validate
+per-axis shift bounds. Direct arguments override mapping entries. `jit_compile` defaults to `False`.
 
 `spectral_conv1d`, `spectral_depthwise_conv1d`, and `spectral_separable_conv1d` remain compatible aliases for the three general-purpose factories.
 
@@ -136,7 +186,7 @@ For output position `t`, tap `r`, and connected input channel `c`, the forward o
 
 Optional input bounding is applied to source features first. Boundary extension defines the source before sampling; interpolation then precedes polynomial evaluation. Thus interpolation of `x**q` is not used as a substitute for `(interpolate(x))**q`.
 
-Transposed PyTorch operators use a sparse upsampled lattice with input-feature offset units retained through stride. They are decoder extensions, rather than an exact reproduction of a paper's transposed neuron. Their ordinary zero-offset, degree-one limit follows the matching ConvTranspose mapping.
+Transposed operators in both backends use a sparse upsampled lattice with input-feature offset units retained through stride. They are decoder extensions, rather than an exact reproduction of a paper's transposed neuron. Their ordinary zero-offset, degree-one limit follows the matching ConvTranspose mapping.
 
 Half/bfloat16 policies retain FP32 interpolation and polynomial arithmetic; float64 remains float64. `conv_precision="autocast"` affects only eligible native convolution paths. Neither backend applies compilation or changes global precision settings automatically.
 
@@ -149,3 +199,47 @@ PyTorch `superonn_regularization_loss(model)` aggregates each registered layer o
 PyTorch state dictionaries store semantic configuration metadata and support `weights_only=True` loading. Recreate a compatible model before loading. Chunk size, recomputation, convolution precision, and compilation are execution choices selected on reconstruction. Older compatible library metadata is handled where supported; arbitrary external checkpoint formats require explicit conversion.
 
 Keras layers implement `get_config()` and register in the `SuperONN` serialization namespace. Import the TensorFlow API before loading a saved `.keras` model in a fresh process. Custom objects supplied by the user need their own serialization support.
+
+
+## Training lifecycle and deployment
+
+All four native cores support optimizer checkpoint resume and supplied-weight
+execution: Keras `stateless_call()` or PyTorch `torch.func.functional_call()`.
+The latter preserves the ordinary module buffers unless replacements are
+provided. Offset buffers/non-trainable weights remain part of the model state.
+
+PyTorch constructors accept `device="meta"` for allocation-free structure
+creation. Materialize with a concrete state dictionary and `assign=True`, or
+call `to_empty(device=...)` followed by `reset_parameters()`. Construct the
+optimizer afterward. `reset_parameters()` also restores the shift-limit buffer.
+
+TensorFlow `Model.export(format="tf_saved_model")` supports serving graphs
+with explicit batch/spatial input signatures. A saved serving endpoint can be
+loaded without importing the layer package. Use `.keras` for optimizer resume.
+PyTorch `torch.export` save/load supports evaluated cores with a declared
+dynamic batch dimension on PyTorch 2.14.1. Spatial/compiler/runtime constraints depend on the
+exported graph; additional deployment formats need separate validation.
+
+Synchronous two-CPU DDP and MirroredStrategy updates, including coefficient
+regularization, match equivalent single-process updates for the four cores.
+Custom distributed training loops must use the framework's loss reduction and
+regularizer scaling rules. Multi-host/GPU distributed paths remain outside
+this checked scope.
+
+## Nested input-gradient penalties
+
+TensorFlow input-gradient penalties, such as R1/gradient penalties, require
+`recompute=False` in every participating core or composition. The installed
+TensorFlow rematerialization API rejects the tested nested derivatives. With
+recomputation disabled, output/input/coefficient/offset derivatives of these
+penalties are checked against PyTorch for all four classes, both sharing
+layouts, and grouped/depthwise connectivity. Saved activation memory increases.
+
+The implementation supplies explicit native convolution data formats so 2D
+shared/depthwise second derivatives avoid a missing-attribute error. This is
+independent of the public channels-first/channels-last tensor layout.
+
+The TensorFlow namespace checks the selected Keras backend and requires
+`KERAS_BACKEND=tensorflow` before Keras is imported. Other Keras backends use
+different tensor/variable systems; use the native PyTorch namespace for
+PyTorch models.
