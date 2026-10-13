@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "superonn"
+version = "0.3.1"
+description = "Polynomial convolution layers with fixed or learned receptive fields for PyTorch and TensorFlow"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["torch>=2.6,<3"]
+license = "MIT"
+license-files = ["LICENSE", "NOTICE.md"]
+keywords = ["superonn", "selfonn", "pytorch", "tensorflow", "convolution", "neural-networks"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10", "numpy>=2.1,<3"]
+tensorflow = ["tensorflow==2.21.0", "keras>=3.15,<4"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
