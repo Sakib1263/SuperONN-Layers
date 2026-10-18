@@ -442,9 +442,11 @@ The focused 0.5.2 checks cover all eight CPU cores with independent outputs and
 input/coefficient/shift gradients, recomputation on/off, state round trips,
 stateless/functional calls and mixed precision. TensorFlow CPU operator and
 whole-function XLA checks pass with layer XLA selected explicitly. PyTorch CUDA
-outputs/gradients/AMP pass on 2.6.0. TensorFlow CUDA is unavailable in the unchanged
-local environment; the PyTorch 2.14.1 CPU Inductor probe timed out during 2D after
-passing 1D. See the [verification scope and measurements](docs/PERFORMANCE.md#focused-052-verification)
+outputs/gradients/AMP pass on 2.6.0. Real PyTorch 2.14.1 CPU Inductor compilation
+passes for all four cores with full/shared offsets and recomputation on/off,
+including input/parameter gradients and three optimizer updates per configuration.
+TensorFlow CUDA is unavailable in the unchanged local environment.
+See the [verification scope and measurements](docs/PERFORMANCE.md#focused-052-verification)
 for versions, tolerances and limits. Earlier lifecycle/export/distributed checks
 remain historical evidence in the changelog.
 

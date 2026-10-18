@@ -113,13 +113,46 @@ directions and gradients for all four operator pairs.
 | TensorFlow operator XLA, CPU | All four cores: outputs and first-order gradients |
 | TensorFlow whole-function XLA, CPU, layer `jit_compile=True` | All four cores: finite loss and input/parameter gradients |
 | PyTorch Dynamo full-graph capture, CPU | All four cores on 2.6.0 and 2.14.1 |
-| PyTorch Inductor, 2.14.1 CPU | 1D full-layout output/gradient parity passed; process reached 150 s while compiling 2D; transpose cases not reached |
+| PyTorch Inductor, 2.14.1 CPU | All four cores: full/shared offsets, recomputation on/off, oracle/eager outputs, input/parameter gradients and three SGD updates per configuration |
 | PyTorch 2.6.0 CUDA | All four cores: oracle outputs, directional gradients and FP16 AMP |
 | TensorFlow CUDA / CUDA XLA | Unavailable in the unchanged environment: no GPU exposed to TensorFlow |
 | Windows/macOS | CI gates configured; not executed locally for this update |
 
 Older lifecycle/export/distributed evidence is recorded in the changelog.
 It does not extend the new execution checks to unexecuted devices or compilers.
+
+### CPU Inductor follow-up
+
+The 2026-10-18 follow-up uses `backend="inductor"`, `fullgraph=True` and
+`dynamic=False` on PyTorch **2.14.1+cu126**, with CUDA hidden. Each core runs in
+its own time/RSS-bounded process. All **16 configurations** (four cores, two
+offset layouts, recomputation on/off) pass, including three sequential SGD
+updates each. Each update compares outputs, input gradients, coefficient/offset/
+bias gradients and updated parameters with eager execution. The initial output
+also matches the independent NumPy oracle. Tolerances are
+`rtol=3e-5, atol=3e-6` for outputs and `rtol=2e-4, atol=3e-6` for gradients
+and updated parameters.
+
+Cases use FP32, degree 2, kernel 2, stride 2, fractional learned offsets and
+partial output chunks. Forward cases include a constant term and dilation 2;
+transpose cases use output padding 1. Inputs are length 4 or images 3 by 3,
+with one input channel for full offsets and two for shared offsets, and three
+output channels. Full cases include input bounding at .7.
+
+| Core | Full offsets, recompute off/on | Shared offsets, recompute off/on | Process wall time | Peak process-tree RSS |
+|---|---|---|---|---|
+| 1D | Pass / Pass | Pass / Pass | 125.2 s | 1,195.5 MiB |
+| 2D | Pass / Pass | Pass / Pass | 162.3 s | 1,257.8 MiB |
+| Transpose 1D | Pass / Pass | Pass / Pass | 122.8 s | 1,188.5 MiB |
+| Transpose 2D | Pass / Pass | Pass / Pass | 179.2 s | 1,293.5 MiB |
+
+The four processes ran concurrently with two CPU and two compiler threads each,
+sharing an initially empty task-local Inductor cache. Times include framework
+startup and compilation; they are diagnostics, not inference/training throughput
+benchmarks. The earlier shared 150-second probe budget left cases unfinished.
+Separate per-core probes now complete without numerical changes to the layers.
+This evidence covers these CPU FP32 cases; other shapes, dtypes, devices and
+containing models need their own checks.
 
 ### Small resource probes
 
@@ -188,6 +221,22 @@ python -B -m tests.run_checks execution --seconds 150
 SUPERONN_PROBE_BACKEND=torch SUPERONN_PROBE_DEVICE=cuda \
 python -B -m tests.run_checks execution --test tests.test_execution.TorchExecutionTests.test_full_chunk_profile
 ```
+
+Run each CPU Inductor core separately so cold compilation has its own budget:
+
+```bash
+for core in 1d 2d transpose1d transpose2d; do
+  CUDA_VISIBLE_DEVICES=-1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 \
+  TORCHINDUCTOR_COMPILE_THREADS=2 \
+  SUPERONN_PROBE_BACKEND=torch SUPERONN_PROBE_DEVICE=cpu SUPERONN_RUN_COMPILER=1 \
+  python -B -m tests.run_checks execution --seconds 1200 --rss-mib 12288 \
+    --test "tests.test_execution.TorchExecutionTests.test_inductor_${core}" || exit 1
+done
+```
+
+Each core checks full/shared offsets and recomputation on/off. Inductor requires
+a working native compiler for CPU code generation. This explicit compiler budget
+does not change the default runner budget or ordinary CPU regression checks.
 
 Compiler probes are conditional and can exceed the budget. An unavailable
 requested device is reported explicitly; it is not a CPU pass. GitHub Actions

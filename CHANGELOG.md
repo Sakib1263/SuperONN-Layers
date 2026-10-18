@@ -25,6 +25,11 @@
   integer geometry out of the recomputation gradient tape. XLA remains opt-in.
 - Retained the native PyTorch numerical/checkpoint implementation after its
   independent review; mathematical/default/state contracts are unchanged.
+- Completed real PyTorch 2.14.1 CPU Inductor forward/backward validation for all
+  four cores with full/shared offsets and recomputation on/off. All 16 compiled
+  configurations match reference/eager outputs, input/parameter gradients and
+  three sequential SGD updates. Separate per-core probes replace the shared
+  compiler budget that previously left 2D/transpose coverage incomplete.
 - Added a maintained independent scalar oracle, finite-difference gradient,
   state/precision/composition and dynamic-graph checks, plus conditional device/
   compiler probes with a bounded runner. Tests ship in the source distribution

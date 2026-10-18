@@ -278,23 +278,74 @@ class TorchExecutionTests(unittest.TestCase):
                        warm_min_s=min(timings), warm_max_s=max(timings),
                        peak_incremental_device_bytes=peak)
 
-    @unittest.skipUnless(COMPILER, "Inductor explicitly opt-in")
-    def test_inductor_all_cores(self):
+    def _inductor_core(self, rank, transposed):
         import torch
         from .test_torch import make, assign
-        for rank, transposed in ((1, False), (2, False), (1, True), (2, True)):
-            case = Case(rank, transposed)
-            arrays = case.data()
-            layer = make(case, dtype=torch.float32, device=DEVICE)
-            assign(layer, arrays)
-            x = torch.tensor(arrays[0], dtype=torch.float32, device=DEVICE, requires_grad=True)
-            compiled = torch.compile(layer, fullgraph=True)
-            expected = layer(x)
-            actual = compiled(x)
-            torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
-            got = torch.autograd.grad(actual.square().sum(), (x, *layer.parameters()))
-            wanted = torch.autograd.grad(expected.square().sum(), (x, *layer.parameters()))
-            for a, b in zip(got, wanted):
-                torch.testing.assert_close(a, b, rtol=2e-4, atol=3e-6)
-            report(backend="torch", device=DEVICE, rank=rank, transpose=transposed,
-                   compiler="Inductor", result="passed")
+        # Each public test is independently selectable so a cold compilation
+        # cannot consume the budget of a later core. Both implementations
+        # (full Horner and shared/native convolution) need real code generation.
+        for kind in ("full", "shared"):
+            for remat in (False, True):
+                case = Case(rank, transposed, kind)
+                arrays = case.data()
+                eager = make(case, recompute=remat, dtype=torch.float32, device=DEVICE)
+                candidate = make(case, recompute=remat, dtype=torch.float32, device=DEVICE)
+                assign(eager, arrays)
+                assign(candidate, arrays)
+                compiled = torch.compile(candidate, backend="inductor",
+                                         fullgraph=True, dynamic=False)
+                optimizers = [torch.optim.SGD(model.parameters(), lr=.01)
+                              for model in (eager, candidate)]
+                synchronize = torch.cuda.synchronize if DEVICE == "cuda" else lambda: None
+                report(backend="torch", version=torch.__version__, device=DEVICE,
+                       rank=rank, transpose=transposed, layout=kind, recompute=remat,
+                       compiler="Inductor", stage="starting")
+                start = time.perf_counter()
+                for step in range(3):
+                    inputs = [torch.tensor(arrays[0] * (1 + .05 * step),
+                                           dtype=torch.float32, device=DEVICE,
+                                           requires_grad=True) for _ in range(2)]
+                    for optimizer in optimizers:
+                        optimizer.zero_grad(set_to_none=True)
+                    expected, actual = eager(inputs[0]), compiled(inputs[1])
+                    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
+                    if step == 0:
+                        np.testing.assert_allclose(actual.detach().cpu().numpy(),
+                                                   forward(case, *arrays),
+                                                   rtol=3e-5, atol=3e-6)
+                    expected.square().sum().backward()
+                    actual.square().sum().backward()
+                    for a, b in zip((inputs[1], *candidate.parameters()),
+                                    (inputs[0], *eager.parameters())):
+                        self.assertIsNotNone(a.grad)
+                        self.assertIsNotNone(b.grad)
+                        self.assertTrue(bool(torch.isfinite(a.grad).all()))
+                        torch.testing.assert_close(a.grad, b.grad, rtol=2e-4, atol=3e-6)
+                    for optimizer in optimizers:
+                        optimizer.step()
+                    for a, b in zip(candidate.parameters(), eager.parameters()):
+                        torch.testing.assert_close(a, b, rtol=2e-4, atol=3e-6)
+                    synchronize()
+                    if step == 0:
+                        cold_seconds = time.perf_counter() - start
+                report(backend="torch", version=torch.__version__, device=DEVICE,
+                       rank=rank, transpose=transposed, layout=kind, recompute=remat,
+                       compiler="Inductor", result="passed", optimizer_steps=3,
+                       cold_forward_backward_s=cold_seconds,
+                       total_s=time.perf_counter() - start)
+
+    @unittest.skipUnless(COMPILER, "Inductor explicitly opt-in")
+    def test_inductor_1d(self):
+        self._inductor_core(1, False)
+
+    @unittest.skipUnless(COMPILER, "Inductor explicitly opt-in")
+    def test_inductor_2d(self):
+        self._inductor_core(2, False)
+
+    @unittest.skipUnless(COMPILER, "Inductor explicitly opt-in")
+    def test_inductor_transpose1d(self):
+        self._inductor_core(1, True)
+
+    @unittest.skipUnless(COMPILER, "Inductor explicitly opt-in")
+    def test_inductor_transpose2d(self):
+        self._inductor_core(2, True)
