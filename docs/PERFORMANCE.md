@@ -1,98 +1,222 @@
 # Performance and troubleshooting
 
-This guide covers execution controls, observed timings, and common setup issues. For constructor details, see the [API reference](API.md); for installation and examples, see the [README](../README.md).
+Execution controls preserve the operator's mathematical settings. Their benefit
+depends on shape, device and containing model. See the [API](API.md) for contracts
+and the [README](../README.md) for installation.
 
-## Framework support
+## Execution controls
 
-| API | Locally verified versions | Coverage |
+| Control | Purpose | Cost or limit |
 |---|---|---|
-| PyTorch | 2.6.0+cu126 and 2.14.1+cu126 | 1D/2D forward and transpose, eager/compiled execution, gradients, AMP, and checkpoints |
-| TensorFlow/Keras | TensorFlow 2.21.0; Keras 3.15.0 and 3.15.1 | 1D/2D forward/transpose, grouped layers and 1D depthwise/separable compositions, eager/graph/XLA training, gradients, mixed precision, and serialization |
-| Python | 3.13.14 | Local CPU and CUDA checks |
+| `output_chunk_size` | Bound simultaneous full-layout output connections | Smaller chunks add sampling/dispatch work; chunking alone does not bound all tensors retained by autodiff |
+| `recompute` | Recompute pure intermediates in backward instead of saving them | Additional compute; backend-specific execution policy below |
+| Compilation | Optional XLA/Inductor optimization | Cold compilation, toolchain requirements and shape specialization |
+| `conv_precision` | `stable` retains stable native-convolution accumulation; `autocast` permits eligible reduced-precision convolutions | Sampling and powers remain FP32 under half/bfloat16 policies; float64 stays float64 |
 
-The GitHub Actions release workflow builds/checks distributions, verifies framework-free metadata, and checks installed backend APIs. Backend jobs use Python 3.11/3.13 with PyTorch 2.6.0/2.14.1, plus Linux/Windows/macOS CPU jobs with Python 3.13 and TensorFlow 2.21.0/Keras 3.15.1. Remote CI results become available after the repository is published and the workflow runs.
+Degree, full/shared offsets, groups, offset bounds and input bounding change the
+model. Hold them and the weights/inputs fixed when comparing execution controls.
+No defaults were changed for the 0.5.2 execution update.
 
-The package supports the tested paths above. ONNX export, multi-host/GPU distributed execution, MPS/XPU, other GPUs, and combinations outside the tested matrix require their own checks.
+### TensorFlow/Keras
 
-Additional lifecycle checks use PyTorch 2.14.1 and TensorFlow 2.21.0/Keras
-3.15.1 on Linux CPU: optimizer resume, functional/stateless calls, independent
-SavedModel serving, dynamic-batch PyTorch export, and synchronous two-CPU
-training. PyTorch meta construction/materialization passes on 2.6.0/2.14.1 CPU
-and 2.14.1 CUDA. Compiled TensorFlow operators also accept supplied stateless
-weights after tracing. These checks are scoped workflows, not deployment or
-distributed-runtime benchmarks.
+With `recompute=True`, explicit coefficient and effective-shift tensors enter
+reusable functions; they are read anew on every call, including stateless calls.
+Compatible batch/spatial sizes and smaller final chunks share signatures.
+Non-XLA full-layout execution uses one sequential runtime chunk loop per group.
+Shared/depthwise paths retain their native convolution implementations.
 
-## Choosing execution controls
+A custom gradient surrounds the complete full-layout loop, but its backward
+recomputes and differentiates **one chunk at a time**. It accumulates a common
+input-gradient buffer and assembles coefficient/offset gradients in their
+original order. A serial forward loop alone was insufficient: TensorFlow's
+automatic loop gradient retained per-chunk passthrough tensors in accumulator
+lists. The maintained regression rejects those lists for all four cores.
+This is chunk-wise recomputation, not simultaneous whole-layer activation replay.
 
-- **Compilation:** PyTorch `Module.compile()` and Keras `Model.compile(jit_compile=True)` can fuse compatible operations. Compilation is disabled by default and has a first-call cost. Fixed input shapes generally make timing and compiler reuse easier to assess.
-- **Operator-level XLA:** TensorFlow layers accept `jit_compile=True`. This is useful inside a custom training loop. Compiling the whole training function can fuse more operations; the two approaches have different overhead.
-- **Chunk size:** `output_chunk_size` limits simultaneous connections in the full sharing layout. Smaller chunks may reduce activation memory while increasing overhead.
-- **Recomputation:** `recompute=True` reduces saved activations by recomputing pure intermediates during backward. Measure the memory/time tradeoff on the actual model.
-- **Precision:** `conv_precision="stable"` is the default. Sampling and polynomial evaluation remain FP32 under half/bfloat16 policies. `"autocast"` permits reduced precision only in eligible native convolution paths; it may not be faster. Float64 remains float64.
+The containing layer and localized recomputation functions use function-local
+no-inline boundaries, including generated backward functions. The experimental
+`_noinline` attribute is verified on the declared TensorFlow **2.21.0** runtime;
+this is not a portability guarantee for other TensorFlow versions. There are
+no process-global graph optimizer or eager-execution changes.
 
-Polynomial degree, sharing layout, offset range, and grouping affect the model's function. Changing them for speed also changes the architecture. Compare execution controls using identical model settings and weights.
+Recomputation remains active when requested, including inference and frozen
+models: these calls can still need input gradients. Integer geometry is not
+watched by the localized recomputation tape. Functions are owned by their layer;
+registered gradient closures hold weak layer references, allowing discarded
+full/shared layers to be collected. There is no library-global input/model cache
+or trainable-result cache. Reconstruct a
+layer when changing execution settings after tracing.
 
-## Measuring your workload
+**XLA is separate and opt-in.** Set `jit_compile=True` on participating cores
+or pass it through each composition/factory when compiling a containing training
+function with XLA. This selects static chunks instead of the non-XLA runtime
+TensorArray path, whose variable-width final chunks are not generally XLA
+compatible. Merely enabling `Model.compile(jit_compile=True)` does not select
+the layer's static chunk path. See the [training example](../examples/tensorflow_training.py).
 
-Record the library/framework versions, hardware, batch size, input shape,
-channel width, polynomial degree, groups, offset mode/sharing, and precision.
-Use identical weights and model settings when comparing execution controls.
+Bounded operator graphs do not guarantee inexpensive native graph optimization
+or backward preparation for every large, coupled training graph. Python tracing,
+native graph instantiation, and backward preparation are different cold costs.
+For additive losses on independent branch inputs, the
+[branch example](../examples/tensorflow_branches.py) reuses a compiled branch
+gradient function and sums its gradients before **one** optimizer update.
+It adds regularization once. Choose branch weights to match the exact objective.
+Activations in other layers, branches, coupled losses and optimizer state can
+still dominate model memory. Per-sample accumulation is not generally equivalent
+for losses that couple examples.
+This recipe does not split losses with cross-branch dependencies, and it does
+not silently detach those dependencies or alter an application's trainer.
 
-Warm up the runtime and synchronize the device around GPU measurements. Report
-first-call compilation latency separately from steady-state forward/backward
-time. Include the measurement count, median and spread, and activation-memory
-measurement method. New shapes may trigger new compilation.
+### PyTorch
 
-Shared and full offsets define different models, so their timing difference
-is an architecture tradeoff. Chunking, recomputation, and compilation can be
-compared while preserving the mathematical settings. Validate the actual
-workload before relying on reduced precision or a compiler speedup.
+The existing native implementation retains bounded full-connection Horner
+evaluation and non-reentrant checkpointing. Checkpointing runs when
+`recompute=True`, the module is in training mode, and gradients are enabled.
+Eval mode uses ordinary autograd and still supports input gradients, including
+frozen parameters. This policy is intentionally different from TensorFlow.
 
-The training examples provide starting models for such measurements. Historical
-timings from older releases have been removed from this guide; they do not
-establish the performance of the current 2D/transpose implementations.
+The checkpointed operations do not draw random numbers; RNG preservation is
+disabled locally for those pure operations. Autocast behavior is handled by the
+non-reentrant checkpoint API and the operator's precision contexts. Connection
+indices and grids remain call-local, with no new persistent buffers/caches or
+device-move invalidation requirements. No PyTorch numerical rewrite was needed
+for this update. First use can include lazy framework/checkpoint imports.
 
-## Common issues
+`torch.compile(..., backend="eager", fullgraph=True)` checks Dynamo capture;
+it does not establish that Inductor compiled native kernels successfully.
 
-### Input shape or channel mismatch
+## Focused 0.5.2 verification
 
-PyTorch expects `[batch, channels, length]` or `[batch, channels, height, width]`; its unbatched equivalents are also accepted. Keras cores and 1D depthwise/separable compositions default to `[batch, length, channels]` or `[batch, height, width, channels]`; `data_format="channels_first"` is also supported. Keras needs the channel count to be known when the layer is built. Both input and output channel counts must be divisible by `groups`.
+Local checks on Linux/WSL use Python 3.13.14, NumPy 2.5.1, PyTorch
+2.6.0+cu126 / 2.14.1+cu126, and TensorFlow 2.21.0 with Keras 3.15.0.
+The independent scalar NumPy oracle samples before taking powers. Float64
+forward tolerance is `rtol=2e-11, atol=2e-12`; gradients use central differences
+with step `1e-6` away from sampling kinks. Full cases check every input,
+coefficient and raw-offset coordinate; grouped/shared/depthwise cases use two
+deterministic directions per tensor. Recomputation on/off is checked in addition
+to the independent oracle.
 
-### Large values or unstable higher-order terms
+All eight CPU cores cover learned shifts, partial chunks, grouping, depthwise/
+shared connectivity, stride/dilation, numeric padding, transpose output padding,
+weight mutation, supplied weights, serialization, mixed BF16 and frozen input
+gradients. TensorFlow also covers fixed-offset save/load, nonzero boundary
+extensions, factories, compositions, nested derivatives without recomputation,
+dynamic shapes, function boundaries, absence of backward accumulator lists,
+and garbage collection of full/shared layer owners. Saved serving is checked
+after original model objects are released; use `.keras` for training/state
+resume rather than assuming exported serving custom gradients are trainable.
+Explicit conversion checks both
+directions and gradients for all four operator pairs.
 
-Check input and intermediate feature ranges before increasing `q`. Consider explicit feature scaling, `input_bound`, and order-aware coefficient regularization. Bounding computes `tanh(input / bound)`; it changes the mapping and must be recorded with the model settings. The coefficient penalty is disabled unless its strength is positive.
+| Additional path | Current scoped result |
+|---|---|
+| TensorFlow operator XLA, CPU | All four cores: outputs and first-order gradients |
+| TensorFlow whole-function XLA, CPU, layer `jit_compile=True` | All four cores: finite loss and input/parameter gradients |
+| PyTorch Dynamo full-graph capture, CPU | All four cores on 2.6.0 and 2.14.1 |
+| PyTorch Inductor, 2.14.1 CPU | 1D full-layout output/gradient parity passed; process reached 150 s while compiling 2D; transpose cases not reached |
+| PyTorch 2.6.0 CUDA | All four cores: oracle outputs, directional gradients and FP16 AMP |
+| TensorFlow CUDA / CUDA XLA | Unavailable in the unchanged environment: no GPU exposed to TensorFlow |
+| Windows/macOS | CI gates configured; not executed locally for this update |
 
-### Compilation fails or recompiles repeatedly
+Older lifecycle/export/distributed evidence is recorded in the changelog.
+It does not extend the new execution checks to unexecuted devices or compilers.
 
-Run the same model eagerly to isolate API and data problems. Try fixed shapes first, then enable compilation. New shapes or unsupported surrounding model operations can cause new graphs or compiler errors. PyTorch's default compiler requires a working supported toolchain; TensorFlow XLA requires the relevant compiler libraries for the selected device.
+### Small resource probes
 
-CUDA XLA needs compatible CUDA libraries, `libdevice`, and `ptxas`. Install the appropriate framework GPU dependencies in your environment. The library does not modify global runtime settings or search paths. XLA may omit in-graph assertions, so validate input contracts before compiled execution.
+These are diagnostics, not throughput benchmarks or a before/after comparison
+against a retained legacy implementation.
 
-### Checkpoint loading fails
+A TensorFlow 1D layer (`q=2`, kernel 2, chunk 2, full learned shifts,
+`input_bound=.7`) was reused in three additive branches, input `[1,8,1]`.
+Five warmed forward/backward calls followed each cold call:
 
-Reconstruct the same architecture, polynomial degree, offset mode, sharing layout, boundary policy, and input bound. A PyTorch state dictionary validates semantic metadata. Execution controls such as chunk size, recomputation, precision policy, and compilation can be selected when rebuilding the layer.
+| Output width | Forward Python trace | First forward execution | Backward Python trace | First backward execution | Warm backward median (min–max) |
+|---|---|---|---|---|---|
+| 3 | 0.103 s | 0.164 s | 0.359 s | 0.525 s | 1.58 ms (1.53–2.22) |
+| 9 | 0.096 s | 0.124 s | 0.379 s | 0.538 s | 4.56 ms (3.84–5.05) |
 
-For Keras, import `superonn.tensorflow` before loading a `.keras` file in a new process. Custom third-party activations, regularizers, and constraints need their own registrations. Checkpoints from unrelated implementations require explicit conversion.
+Both widths had **357** layer-forward graph nodes and **1,780** containing
+training graph nodes, each including its function definitions. Containing
+forward/backward call graphs had 33/36 nodes. Layer, chunk and VJP functions each
+retained one trace after changed batch/spatial sizes. The bounded CPU probe
+peaked at 835.2 MiB sampled process-tree RSS.
+RSS includes framework overhead and is not activation memory. These numbers do
+not establish behavior for arbitrary monolithic model graphs.
 
-### Missing backend or runtime resources
+On an RTX 3080 Ti Laptop GPU, PyTorch 2.6.0 full-layout toy cases used identical
+weights, `q=2`, chunk 2, one input/three outputs, kernel 2, batch 1, and input
+length 4 or image 3×3. Forward cases included a constant term, dilation 2 and
+stride 2; transpose used stride 2 and output padding 1. Both used bound .7.
 
-Install the selected backend extra (`[torch]` or `[tensorflow]`) in the same environment that runs your model. Install both for layer conversion. XLA needs a working compiler runtime. Limit TensorFlow thread counts on constrained systems if the runtime cannot create its worker threads.
+| Core | Warm backward step median, recompute off → on | Incremental peak allocated tensor memory, off → on |
+|---|---|---|
+| 1D | 7.38 → 11.98 ms | 35,328 → 24,576 bytes |
+| 2D | 24.43 → 46.88 ms | 130,560 → 72,192 bytes |
+| Transpose 1D | 6.57 → 11.67 ms | 36,864 → 25,600 bytes |
+| Transpose 2D | 24.21 → 42.28 ms | 132,096 → 73,216 bytes |
 
+GPU timings synchronize around each call; five samples report min/max in probe
+output. Peak memory subtracts persistent allocations and is captured before
+oracle/AMP validation. It counts PyTorch allocated tensors, not allocator
+reservation, process memory or external GPU consumers. Small tensors are
+dominated by dispatch overhead. Recomputation saved tensor memory at additional
+compute cost; no general throughput improvement is claimed.
 
-## Nested input-gradient penalties
+## Reproduce the focused checks
 
-TensorFlow input-gradient penalties, such as R1/gradient penalties, require
-`recompute=False` in every participating core or composition. The installed
-TensorFlow rematerialization API rejects the tested nested derivatives. With
-recomputation disabled, output/input/coefficient/offset derivatives of these
-penalties are checked against PyTorch for all four classes, both sharing
-layouts, and grouped/depthwise connectivity. Saved activation memory increases.
+Install development dependencies in your chosen development environment:
 
-The implementation supplies explicit native convolution data formats so 2D
-shared/depthwise second derivatives avoid a missing-attribute error. This is
-independent of the public channels-first/channels-last tensor layout.
+```bash
+python -m pip install -e ".[test,torch]"       # or .[test,tensorflow]
+python -B -m tests.run_checks base
+python -B -m tests.run_checks torch
+python -B -m tests.run_checks tensorflow
+python -B -m tests.run_checks interop         # requires both
+```
 
-The TensorFlow namespace checks the selected Keras backend and requires
-`KERAS_BACKEND=tensorflow` before Keras is imported. Other Keras backends use
-different tensor/variable systems; use the native PyTorch namespace for
-PyTorch models.
+The runner bounds child wall time (180 s by default) and samples process-tree
+RSS on Linux (3,072 MiB by default). Summed RSS conservatively counts shared
+pages in each descendant; GPU allocations are separate. RSS accounting is
+unavailable on other operating systems. Use separate backend processes for
+device/compiler checks. Set process-local environment variables, for example:
+
+```bash
+CUDA_VISIBLE_DEVICES=-1 OMP_NUM_THREADS=2 TF_NUM_INTRAOP_THREADS=2 TF_NUM_INTEROP_THREADS=2 \
+SUPERONN_PROBE_BACKEND=tensorflow SUPERONN_RUN_COMPILER=1 \
+python -B -m tests.run_checks execution --seconds 150
+
+SUPERONN_PROBE_BACKEND=torch SUPERONN_PROBE_DEVICE=cuda \
+python -B -m tests.run_checks execution --test tests.test_execution.TorchExecutionTests.test_full_chunk_profile
+```
+
+Compiler probes are conditional and can exceed the budget. An unavailable
+requested device is reported explicitly; it is not a CPU pass. GitHub Actions
+retains distribution/installed-API checks and adds compact CPU regression gates
+without adding matrix dimensions. Remote results are only known after jobs run.
+
+## Nested derivatives and troubleshooting
+
+TensorFlow losses that differentiate input gradients, including R1/gradient
+penalties, require `recompute=False` in every participating core/composition.
+Recomputed paths do not provide a supported higher-order derivative contract;
+the TensorFlow rematerialization helper can reject nested derivatives. The
+library does not silently disable recomputation. Native nested derivatives retain
+more activations. This restriction applies separately from compilation.
+
+Use positive spatial sizes, known channels at Keras build time and channel counts
+divisible by groups. PyTorch expects channels first; Keras supports both layouts
+through native channels-last calculation. Bound or scale large inputs before
+increasing degree; input bounding changes the function.
+
+For checkpoints, reconstruct identical mathematical settings. Execution controls
+can be selected on reconstruction. Import `superonn.tensorflow` before loading
+a `.keras` file; user-defined custom objects need their own registration.
+After updating the installed package or checkout, restart existing Python/
+notebook workers and rebuild/reload models to discard old traced functions.
+An existing model instance does not automatically replace cached executable code.
+
+Install backend/compiler dependencies explicitly for your platform. The library
+does not change global eager settings, optimizer configuration, runtime search
+paths, or silently switch execution semantics. Missing CUDA libraries/`libdevice`/
+`ptxas` are environment issues; additional platforms, ONNX, multi-host/GPU
+distributed training and other accelerators need their own verification.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "superonn"
-version = "0.5.1"
+version = "0.5.2"
 description = "Polynomial convolution layers with fixed or learned receptive fields for PyTorch and TensorFlow"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,6 +29,7 @@ Issues = "https://github.com/Sakib1263/SuperONN-Layers/issues"
 [project.optional-dependencies]
 torch = ["torch>=2.6,<3"]
 tensorflow = ["tensorflow==2.21.0", "keras>=3.15,<4"]
+test = ["numpy>=1.26,<3"]
 
 [tool.setuptools.packages.find]
 where = ["."]

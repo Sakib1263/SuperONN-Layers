@@ -131,3 +131,19 @@ CPU CI covers Linux, Windows, and macOS with TensorFlow, plus Linux PyTorch
 version checks. Framework wheels, GPU support, and compiler availability depend
 on the operating system and hardware. Local numerical checks are performed on
 Linux under WSL; additional operating-system verification comes from CI.
+
+## Execution settings after transfer
+
+Transfer preserves supported mathematical configuration and copies current
+state. It does not transfer compiled graphs or replace one backend's
+checkpointing machinery with the other's. TensorFlow 0.5.2 functions read
+explicit current weights, including after transfer or `stateless_call()`.
+There is no cached trainable result to invalidate.
+
+Choose TensorFlow `jit_compile=True` during construction/conversion when using
+a containing XLA function. Reconstruct layers to change traced options.
+PyTorch eval-mode autograd and TensorFlow requested recomputation have different
+policies; both support frozen-model input gradients. TensorFlow nested
+input-gradient losses require `recompute=False` in participating layers.
+See [current compiler/device scope](PERFORMANCE.md); CPU conversion parity does
+not validate joint GPU startup.

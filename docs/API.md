@@ -229,8 +229,9 @@ this checked scope.
 ## Nested input-gradient penalties
 
 TensorFlow input-gradient penalties, such as R1/gradient penalties, require
-`recompute=False` in every participating core or composition. The installed
-TensorFlow rematerialization API rejects the tested nested derivatives. With
+`recompute=False` in every participating core or composition. Recomputed paths
+do not provide a supported higher-order derivative contract; the TensorFlow
+rematerialization helper can reject nested derivatives. With
 recomputation disabled, output/input/coefficient/offset derivatives of these
 penalties are checked against PyTorch for all four classes, both sharing
 layouts, and grouped/depthwise connectivity. Saved activation memory increases.
@@ -243,3 +244,27 @@ The TensorFlow namespace checks the selected Keras backend and requires
 `KERAS_BACKEND=tensorflow` before Keras is imported. Other Keras backends use
 different tensor/variable systems; use the native PyTorch namespace for
 PyTorch models.
+
+## Execution and trace lifetime (0.5.2)
+
+TensorFlow recomputation uses explicit current tensor weights and layer-owned
+functions with dynamic batch/spatial/final-chunk signatures. Non-XLA full-layout
+chunks execute in sequential runtime loops, retaining per-chunk activation
+control. Their custom backward streams individual chunk VJPs, accumulates one
+input-gradient buffer and avoids automatic per-chunk loop tape accumulators.
+Registered gradient closures use weak owner references, allowing discarded
+full/shared layers to be collected. Frozen weights and `training=False` still
+permit input gradients.
+Function-local experimental no-inline boundaries are verified on TensorFlow
+2.21.0. See [execution details](PERFORMANCE.md).
+
+For whole-function/model XLA, construct participating cores/compositions with
+`jit_compile=True` to select static chunk loops. The outer compiler flag alone
+does not select that path. PyTorch retains non-reentrant checkpointing in
+training mode with gradients enabled, and ordinary autograd in eval mode.
+
+Cached executable functions are not serialized state. Mathematical settings,
+weight axes, public names and 0.5.x checkpoint compatibility are unchanged.
+Reconstruct layers to change traced configuration and restart existing workers
+after package/source updates. Stateless/functional calls use supplied weights;
+they do not mutate persistent variables or transfer optimizer state.

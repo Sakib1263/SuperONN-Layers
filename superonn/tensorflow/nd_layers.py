@@ -8,7 +8,7 @@ from numbers import Integral, Real
 import tensorflow as tf
 
 from .functional import position_grid, sample_nd, sparse_upsample, spatial_tuple, normalize_padding
-from .layers import _positive_integer, _CombinedRegularizer
+from .layers import _positive_integer, _CombinedRegularizer, _compiled_recompute, _compiled_chunk_vjp, _bounded_recomputed_chunks
 
 
 @tf.keras.utils.register_keras_serializable(package="SuperONN")
@@ -196,6 +196,40 @@ class _SuperONNND(tf.keras.layers.Layer):
                                                trainable=self.shift_mode == "learned", autocast=False)
         self.bias = self.add_weight(name="bias", shape=(self.filters,), initializer=self.bias_initializer,
                                     regularizer=self.bias_regularizer, constraint=self.bias_constraint, autocast=False) if self.use_bias else None
+        dtype = self.stable_dtype
+        values = tf.TensorSpec((None,) * (self.spatial_rank + 1) + (self.input_channels,), dtype)
+        kernel_shape = (*self.kernel_size, self.channels_per_group, self.orders)
+        shifts_shape = (None, self.channels_per_group, self.spatial_rank)
+        self._recomputed_full_chunk = _compiled_recompute(
+            self._full_chunk,
+            (values, tf.TensorSpec((*kernel_shape, None), dtype),
+             tf.TensorSpec(shifts_shape, dtype),
+             tf.TensorSpec((None, self.spatial_rank), dtype),
+             tf.TensorSpec((self.channels_per_group,), tf.int32)), 4,
+        )
+        self._full_chunk_vjp = _compiled_chunk_vjp(
+            self._full_chunk,
+            (values, tf.TensorSpec((*kernel_shape, None), dtype),
+             tf.TensorSpec(shifts_shape, dtype),
+             tf.TensorSpec((None, self.spatial_rank), dtype),
+             tf.TensorSpec((self.channels_per_group,), tf.int32)),
+        )
+        self._recomputed_shared = _compiled_recompute(
+            self._shared_recompute_operation,
+            (values, tf.TensorSpec((*kernel_shape, self.filters), dtype),
+             tf.TensorSpec(shifts_shape, dtype),
+             tf.TensorSpec((self.spatial_rank,), tf.int32),
+             tf.TensorSpec((self.spatial_rank,), tf.int32)), 3,
+        )
+        self._graph_operation = tf.function(
+            self._operation,
+            input_signature=(values,
+                             tf.TensorSpec((*kernel_shape, self.filters), dtype),
+                             tf.TensorSpec(self.shift_parameter.shape, dtype),
+                             tf.TensorSpec((self.filters,) if self.bias is not None else (), dtype)),
+            autograph=False, jit_compile=False,
+            experimental_attributes={"_noinline": True},
+        )
         super().build(input_shape)
 
     def effective_shifts(self):
@@ -300,6 +334,10 @@ class _SuperONNND(tf.keras.layers.Layer):
             outputs.append(tf.cast(result, self.stable_dtype))
         return tf.concat(outputs, axis=-1)
 
+    def _shared_recompute_operation(self, inputs, kernel, shifts, counts, origins):
+        effective = tuple((k - 1) * dil + 1 for k, dil in zip(self.kernel_size, self.dilation_rate))
+        return self._shared(inputs, kernel, shifts, counts, origins, effective)
+
     def _operation(self, inputs, kernel, shifts, bias):
         values = tf.cast(inputs, self.stable_dtype)
         if self.input_bound is not None:
@@ -317,27 +355,30 @@ class _SuperONNND(tf.keras.layers.Layer):
         if self.shift_sharing == "shared" or self.filters_per_group == 1 or not any(self.max_shift):
             if not any(self.max_shift):
                 shifts = tf.zeros((self.groups, self.channels_per_group, self.spatial_rank), self.stable_dtype) + tf.reduce_sum(shifts) * 0
-            def shared_operation(v, w, delta):
-                return self._shared(v, w, delta, counts, origins, effective)
-            result = tf.recompute_grad(shared_operation)(values, kernel, shifts) if self.recompute else shared_operation(values, kernel, shifts)
+            result = (self._recomputed_shared(values, kernel, shifts, counts, origins)
+                      if self.recompute else self._shared(values, kernel, shifts, counts, origins, effective))
         else:
             positions = position_grid(counts, steps, origins, self.stable_dtype)
-            chunks = []
-            for group in range(self.groups):
-                channels = tf.range(group * self.channels_per_group, (group + 1) * self.channels_per_group)
-                group_end = (group + 1) * self.filters_per_group
-                for start in range(group * self.filters_per_group, group_end, self.output_chunk_size):
-                    end = min(start + self.output_chunk_size, group_end)
-                    w, delta = kernel[..., start:end], shifts[start:end]
-                    def chunk_operation(v, w, delta, p, channel_indices=channels):
-                        return self._full_chunk(v, w, delta, p, channel_indices)
-                    chunks.append(tf.recompute_grad(chunk_operation)(values, w, delta, positions) if self.recompute else chunk_operation(values, w, delta, positions))
-            result = tf.reshape(tf.concat(chunks, -1), tf.concat(([tf.shape(inputs)[0]], counts, [self.filters]), 0))
+            if self.recompute and not self.jit_compile:
+                flat = _bounded_recomputed_chunks(self, values, kernel, shifts, positions)
+            else:
+                chunks = []
+                for group in range(self.groups):
+                    channels = tf.range(group * self.channels_per_group, (group + 1) * self.channels_per_group)
+                    group_end = (group + 1) * self.filters_per_group
+                    for start in range(group * self.filters_per_group, group_end, self.output_chunk_size):
+                        end = min(start + self.output_chunk_size, group_end)
+                        w, delta = kernel[..., start:end], shifts[start:end]
+                        chunks.append(self._recomputed_full_chunk(values, w, delta, positions, channels)
+                                      if self.recompute else self._full_chunk(values, w, delta, positions, channels))
+                flat = tf.concat(chunks, -1)
+            result = tf.reshape(flat, tf.concat(([tf.shape(inputs)[0]], counts, [self.filters]), 0))
         if self.bias is not None:
             result = result + tf.cast(bias, self.stable_dtype)
         return tf.cast(self.activation(result), self.compute_dtype)
 
     def call(self, inputs):
+        original_shape = inputs.shape
         if self.data_format == "channels_first":
             inputs = tf.transpose(inputs, (0, *range(2, self.spatial_rank + 2), 1))
         # Read variables outside tf.function, including during symbolic build.
@@ -346,9 +387,15 @@ class _SuperONNND(tf.keras.layers.Layer):
         sizes = tf.shape(inputs)[1:1 + self.spatial_rank]
         tf.debugging.assert_positive(sizes, message="Input spatial sizes must be positive")
         tf.debugging.assert_positive(self._geometry(sizes)[0], message="Output spatial sizes must be positive")
-        result = self._compiled_operation(*args) if self.jit_compile else self._operation(*args)
+        if self.jit_compile:
+            result = self._compiled_operation(*args)
+        elif self.recompute:
+            result = self._graph_operation(*[tf.cast(value, self.stable_dtype) for value in args])
+        else:
+            result = self._operation(*args)
         if self.data_format == "channels_first":
             result = tf.transpose(result, (0, self.spatial_rank + 1, *range(1, self.spatial_rank + 1)))
+        result.set_shape(self.compute_output_shape(original_shape))
         return result
 
     def compute_output_shape(self, input_shape):

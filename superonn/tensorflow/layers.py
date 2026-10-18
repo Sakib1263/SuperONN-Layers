@@ -19,6 +19,7 @@ neuron model or an exact reproduction of a published training experiment.
 from __future__ import annotations
 
 import math
+import weakref
 from numbers import Integral
 from typing import Any
 
@@ -39,6 +40,145 @@ def _spatial_integer(value, name):
             raise ValueError(f"{name} must contain one spatial entry")
         value = value[0]
     return _positive_integer(value, name)
+
+
+def _weak_bound_operation(function):
+    """Do not let TensorFlow's gradient registry retain a discarded layer.
+
+    Graph-mode custom gradients are registered beyond a layer's lifetime.
+    Their Python closures must not strongly capture the owning bound method.
+    The normal layer/model owns its executable functions while in use.
+    """
+    reference = weakref.WeakMethod(function)
+
+    def invoke(*args):
+        operation = reference()
+        if operation is None:
+            raise RuntimeError("The owning SuperONN layer no longer exists")
+        return operation(*args)
+
+    return invoke
+
+
+def _compiled_recompute(function, signature, differentiable_count):
+    """Keep recomputation's custom-gradient walk inside a reusable FuncGraph.
+
+    Inlining one recompute_grad per output chunk into a large caller graph
+    makes TensorFlow repeatedly walk upstream forward/gradient subgraphs.
+    Explicit tensor arguments and a dynamic signature bound that walk and
+    reuse the same forward/backward function for batches and final chunks.
+    Integer geometry is captured only from this function's own placeholders,
+    not watched by the localized gradient tape or captured from a caller.
+    """
+    function = _weak_bound_operation(function)
+
+    def recomputed(*args):
+        def operation(*values):
+            return function(*values, *args[differentiable_count:])
+        return tf.recompute_grad(operation)(*args[:differentiable_count])
+
+    # Preserve this boundary through Grappler as well as Python tracing.
+    # Otherwise the function optimizer can inline every chunk and its backward
+    # body again, consuming excessive CPU memory on a full-width model. TF
+    # carries this attribute into generated forward/backward functions.
+    return tf.function(recomputed, input_signature=signature, autograph=False,
+                       jit_compile=False, experimental_attributes={"_noinline": True})
+
+
+def _compiled_chunk_vjp(function, signature):
+    """Recompute and differentiate only one chunk, with no enclosing loop tape."""
+    function = _weak_bound_operation(function)
+
+    def vjp(values, kernel, shifts, positions, channels, upstream):
+        with tf.GradientTape(watch_accessed_variables=False) as tape:
+            tape.watch((values, kernel, shifts))
+            result = function(values, kernel, shifts, positions, channels)
+        gradients = tape.gradient(
+            result, (values, kernel, shifts), output_gradients=upstream,
+            unconnected_gradients=tf.UnconnectedGradients.ZERO,
+        )
+        return tuple(tf.convert_to_tensor(value) for value in gradients)
+
+    return tf.function(
+        vjp, input_signature=(*signature, tf.TensorSpec((None, None, None), signature[0].dtype)),
+        autograph=False, jit_compile=False, experimental_attributes={"_noinline": True},
+    )
+
+
+def _bounded_recomputed_chunks(layer, inputs, kernel, shifts, positions):
+    """Stream chunk forward/VJPs without saving a separate loop gradient tape.
+
+    Autodifferentiating a While containing per-chunk custom gradients retains
+    their passthrough inputs and allocates input-sized zero gradients per chunk.
+    A sequential forward loop alone therefore does NOT bound backward memory.
+    One custom VJP around the complete loop retains its common inputs once;
+    the backward loop recomputes/differentiates one chunk at a time and sums
+    its input gradient. Coefficient/offset gradients are concatenated in their
+    original order. Chunk size, arithmetic and per-chunk recomputation remain
+    unchanged. XLA retains its separate static-loop path.
+    """
+    # The registered custom-gradient closure can outlive its owning model.
+    layer = weakref.proxy(layer)
+    count = (layer.filters_per_group + layer.output_chunk_size - 1) // layer.output_chunk_size
+
+    @tf.custom_gradient
+    def streamed(values, coefficients, offsets):
+        outputs = []
+        for group in range(layer.groups):
+            first = group * layer.filters_per_group
+            last = first + layer.filters_per_group
+            channels = tf.range(group * layer.channels_per_group, (group + 1) * layer.channels_per_group)
+            chunks = tf.TensorArray(layer.stable_dtype, size=count, infer_shape=False,
+                                    element_shape=(None, None, None))
+
+            def body(index, array, first=first, last=last, channels=channels):
+                start = first + index * layer.output_chunk_size
+                end = tf.minimum(start + layer.output_chunk_size, last)
+                result = layer._recomputed_full_chunk(
+                    values, coefficients[..., start:end], offsets[start:end], positions, channels)
+                return index + 1, array.write(index, tf.transpose(result, (2, 0, 1)))
+
+            _, chunks = tf.while_loop(lambda index, _: index < count, body,
+                                      (tf.constant(0), chunks), parallel_iterations=1)
+            outputs.append(tf.transpose(chunks.concat(), (1, 2, 0)))
+
+        def gradient(upstream):
+            input_gradient = tf.zeros_like(values)
+            kernel_gradients, shift_gradients = [], []
+            rank = coefficients.shape.rank
+            output_first = (rank - 1, *range(rank - 1))
+            output_last = (*range(1, rank), 0)
+            for group in range(layer.groups):
+                first = group * layer.filters_per_group
+                last = first + layer.filters_per_group
+                channels = tf.range(group * layer.channels_per_group, (group + 1) * layer.channels_per_group)
+                kernel_chunks = tf.TensorArray(layer.stable_dtype, size=count, infer_shape=False)
+                shift_chunks = tf.TensorArray(layer.stable_dtype, size=count, infer_shape=False)
+
+                def backward(index, accumulated, kernel_array, shift_array,
+                             first=first, last=last, channels=channels):
+                    start = first + index * layer.output_chunk_size
+                    end = tf.minimum(start + layer.output_chunk_size, last)
+                    dx, dw, ds = layer._full_chunk_vjp(
+                        values, coefficients[..., start:end], offsets[start:end], positions,
+                        channels, upstream[..., start:end],
+                    )
+                    return (index + 1, accumulated + dx,
+                            kernel_array.write(index, tf.transpose(dw, output_first)),
+                            shift_array.write(index, ds))
+
+                _, input_gradient, kernel_chunks, shift_chunks = tf.while_loop(
+                    lambda index, *_: index < count, backward,
+                    (tf.constant(0), input_gradient, kernel_chunks, shift_chunks),
+                    parallel_iterations=1,
+                )
+                kernel_gradients.append(tf.transpose(kernel_chunks.concat(), output_last))
+                shift_gradients.append(shift_chunks.concat())
+            return input_gradient, tf.concat(kernel_gradients, axis=-1), tf.concat(shift_gradients, axis=0)
+
+        return tf.concat(outputs, axis=-1), gradient
+
+    return streamed(inputs, kernel, shifts)
 
 
 @tf.keras.utils.register_keras_serializable(package="SuperONN")
@@ -349,6 +489,41 @@ class SuperONN1D(tf.keras.layers.Layer):
                             dtype=self.variable_dtype, autocast=False)
             if self.use_bias else None
         )
+        dtype = self.stable_dtype
+        values = tf.TensorSpec((None, None, self.input_channels), dtype)
+        kernel_shape = (self.kernel_size, self.channels_per_group, self.orders)
+        self._recomputed_full_chunk = _compiled_recompute(
+            self._full_chunk,
+            (values, tf.TensorSpec((*kernel_shape, None), dtype),
+             tf.TensorSpec((None, self.channels_per_group), dtype),
+             tf.TensorSpec((None,), dtype),
+             tf.TensorSpec((self.channels_per_group,), tf.int32)), 4,
+        )
+        self._full_chunk_vjp = _compiled_chunk_vjp(
+            self._full_chunk,
+            (values, tf.TensorSpec((*kernel_shape, None), dtype),
+             tf.TensorSpec((None, self.channels_per_group), dtype),
+             tf.TensorSpec((None,), dtype),
+             tf.TensorSpec((self.channels_per_group,), tf.int32)),
+        )
+        self._recomputed_shared = _compiled_recompute(
+            self._shared_recompute_operation,
+            (values, tf.TensorSpec((*kernel_shape, self.filters), dtype),
+             tf.TensorSpec((None, self.channels_per_group), dtype),
+             tf.TensorSpec((), tf.int32), tf.TensorSpec((), tf.int32)), 3,
+        )
+        # Reuse the layer's chunk-call graph as well. Multiple model branches
+        # can call the same layer many times in a single training
+        # step; inlining those loops repeatedly needlessly duplicates graphs.
+        self._graph_operation = tf.function(
+            self._operation,
+            input_signature=(values,
+                             tf.TensorSpec((*kernel_shape, self.filters), dtype),
+                             tf.TensorSpec(self.shift_parameter.shape, dtype),
+                             tf.TensorSpec((self.filters,) if self.bias is not None else (), dtype)),
+            autograph=False, jit_compile=False,
+            experimental_attributes={"_noinline": True},
+        )
         super().build(input_shape)
 
     def effective_shifts(self):
@@ -434,6 +609,10 @@ class SuperONN1D(tf.keras.layers.Layer):
             result = result + tf.reduce_sum(polynomial if self.include_constant else polynomial * sampled, axis=-1)
         return result
 
+    def _shared_recompute_operation(self, inputs, kernel, shifts, count, left):
+        effective_kernel = (self.kernel_size - 1) * self.dilation_rate + 1
+        return self._shared(inputs, kernel, shifts, count, left, effective_kernel)
+
     def _operation(self, inputs, kernel, shifts, bias):
         values = tf.cast(inputs, self.stable_dtype)
         if self.input_bound is not None:
@@ -450,35 +629,33 @@ class SuperONN1D(tf.keras.layers.Layer):
                 # derivative to all offsets in the no-shift ablation.
                 shifts = tf.zeros((self.groups, self.channels_per_group), dtype=self.stable_dtype) + tf.reduce_sum(shifts) * tf.constant(0., self.stable_dtype)
             if self.recompute:
-                def shared_operation(v, w, delta):
-                    return self._shared(v, w, delta, count, left, effective_kernel)
-                result = tf.recompute_grad(shared_operation)(values, kernel, shifts)
+                result = self._recomputed_shared(values, kernel, shifts, count, left)
             else:
                 result = self._shared(values, kernel, shifts, count, left, effective_kernel)
         else:
             positions = tf.cast(tf.range(count) * self.strides - left, self.stable_dtype)
-            chunks = []
-            for group in range(self.groups):
-                channels = tf.range(group * self.channels_per_group, (group + 1) * self.channels_per_group)
-                group_end = (group + 1) * self.filters_per_group
-                for start in range(group * self.filters_per_group, group_end, self.output_chunk_size):
-                    end = min(start + self.output_chunk_size, group_end)
-                    chunk_kernel, chunk_shifts = kernel[:, :, :, start:end], shifts[start:end]
-                    # Differentiable arguments are explicit. Binding channels
-                    # as a default captures the current group, not the final
-                    # loop value, and avoids watching an integer channel tensor.
-                    if self.recompute:
-                        def chunk_operation(v, w, d, p, channel_indices=channels):
-                            return self._full_chunk(v, w, d, p, channel_indices)
-                        chunks.append(tf.recompute_grad(chunk_operation)(values, chunk_kernel, chunk_shifts, positions))
-                    else:
-                        chunks.append(self._full_chunk(values, chunk_kernel, chunk_shifts, positions, channels))
-            result = tf.concat(chunks, axis=-1)
+            if self.recompute and not self.jit_compile:
+                result = _bounded_recomputed_chunks(self, values, kernel, shifts, positions)
+            else:
+                chunks = []
+                for group in range(self.groups):
+                    channels = tf.range(group * self.channels_per_group, (group + 1) * self.channels_per_group)
+                    group_end = (group + 1) * self.filters_per_group
+                    for start in range(group * self.filters_per_group, group_end, self.output_chunk_size):
+                        end = min(start + self.output_chunk_size, group_end)
+                        chunk_kernel, chunk_shifts = kernel[:, :, :, start:end], shifts[start:end]
+                        if self.recompute:
+                            chunks.append(self._recomputed_full_chunk(
+                                values, chunk_kernel, chunk_shifts, positions, channels))
+                        else:
+                            chunks.append(self._full_chunk(values, chunk_kernel, chunk_shifts, positions, channels))
+                result = tf.concat(chunks, axis=-1)
         if self.bias is not None:
             result = result + tf.cast(bias, self.stable_dtype)
         return tf.cast(self.activation(result), self.compute_dtype)
 
     def call(self, inputs):
+        original_shape = inputs.shape
         if self.data_format == "channels_first":
             inputs = tf.transpose(inputs, (0, 2, 1))
         # Explicit tensor arguments prevent Keras' stateless shape-inference
@@ -492,9 +669,13 @@ class SuperONN1D(tf.keras.layers.Layer):
             tf.debugging.assert_positive(tf.shape(inputs)[1], message="spectral length must be positive")
             self._output_grid(tf.shape(inputs)[1])
             result = self._compiled_operation(*args)
+        elif self.recompute:
+            result = self._graph_operation(*[tf.cast(value, self.stable_dtype) for value in args])
         else:
             result = self._operation(*args)
-        return tf.transpose(result, (0, 2, 1)) if self.data_format == "channels_first" else result
+        result = tf.transpose(result, (0, 2, 1)) if self.data_format == "channels_first" else result
+        result.set_shape(self.compute_output_shape(original_shape))
+        return result
 
     def compute_output_shape(self, input_shape):
         return output_shape_1d(input_shape, self.filters, self.kernel_size, self.strides,

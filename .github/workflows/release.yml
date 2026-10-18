@@ -46,7 +46,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install torch==${{ matrix.torch }} --index-url https://download.pytorch.org/whl/cpu
-      - run: python -m pip install --no-deps .
+      - run: python -m pip install '.[test]'
+      - name: CPU PyTorch regression gate
+        run: python -B -m tests.run_checks torch
       - name: Check installed PyTorch API
         working-directory: ${{ runner.temp }}
         run: |
@@ -72,7 +74,9 @@ jobs:
       - uses: actions/setup-python@v7.0.0
         with:
           python-version: '3.13'
-      - run: python -m pip install '.[tensorflow]' keras==3.15.1
+      - run: python -m pip install '.[tensorflow,test]' keras==3.15.1
+      - name: CPU TensorFlow regression gate
+        run: python -B -m unittest -v tests.test_base tests.test_tensorflow
       - name: Check installed TensorFlow API
         shell: bash
         working-directory: ${{ runner.temp }}

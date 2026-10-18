@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.5.2 — Unreleased
+
+- Isolated TensorFlow recomputation inside reusable, dynamically shaped chunk
+  functions, bounding the localized custom-gradient dependency walk rather
+  than replicating it for each chunk in a caller's training graph.
+- Kept those boundaries intact during Grappler optimization with function-local
+  no-inline attributes, including generated backward functions.
+- Reused the containing layer graph across repeated model branches
+  without coarsening the original per-chunk activation checkpointing policy.
+- Replaced Python-unrolled recomputed chunks with a sequential TensorFlow
+  runtime loop, bounding graph size and concurrent chunk intermediates. The
+  optional XLA path retains static chunks for TensorList compatibility.
+- Added a streamed custom VJP for non-XLA full layouts. Backward recomputes one
+  chunk at a time, accumulates one input-gradient buffer, and concatenates the
+  coefficient/offset gradients. This removes the per-chunk tape accumulator
+  lists that an autodifferentiated sequential forward loop still retained.
+- Prevented TensorFlow's registered gradient closures from retaining discarded
+  layers by using weak owner references. Full/shared lifetime and saved-serving
+  regressions cover all four cores.
+- Applied the same execution boundary to shared/depthwise, spatial and transpose
+  operators, retaining coefficients, shifts, chunk sizes and checkpoint layouts.
+- Kept tensor weights explicit for stateless calls and serialization, and kept
+  integer geometry out of the recomputation gradient tape. XLA remains opt-in.
+- Retained the native PyTorch numerical/checkpoint implementation after its
+  independent review; mathematical/default/state contracts are unchanged.
+- Added a maintained independent scalar oracle, finite-difference gradient,
+  state/precision/composition and dynamic-graph checks, plus conditional device/
+  compiler probes with a bounded runner. Tests ship in the source distribution
+  and use a separate optional development extra.
+- Added CPU regression gates to the existing release workflow and aligned
+  documentation with current verification scope, cold costs and resource limits.
+- Selected layer-level static chunks in the optional whole-model XLA example;
+  added independent-branch gradient aggregation with one regularizer and one
+  optimizer update. Documented monolithic-graph/nested-gradient limits and
+  restart requirements. No release or tag was created.
+
 ## 0.5.1 — 2026-10-13
 
 - Enabled PyTorch meta-device construction and deferred materialization without

@@ -6,7 +6,7 @@ offsets for PyTorch and TensorFlow/Keras.**
 Build signal and image models, encoders, decoders, generators, regressors, and
 discriminators using familiar layer interfaces. The library implements the
 [published Self-ONN/Super Neuron mechanisms](#research-and-citation) with explicit
-grouping, interpolation, boundary, precision, and checkpoint contracts. This checkout targets **0.5.1**
+grouping, interpolation, boundary, precision, and checkpoint contracts. This checkout targets **0.5.2**
 and is licensed under **MIT**.
 
 | Operation | PyTorch | TensorFlow/Keras |
@@ -80,6 +80,20 @@ This version fixes replicate-boundary offset gradients, composition shape
 inference, and state-transfer validation. Record the library version when
 resuming an experiment, since corrected edge gradients can change subsequent
 training updates. See [CHANGELOG.md](CHANGELOG.md) for the full changes.
+
+### Updating an existing checkout
+
+0.5.2 preserves 0.5.x coefficient/offset layouts, mathematical defaults and
+serialization names. Reconstruct compatible layers and load existing state;
+no weight conversion is required. After installation or source updates, restart
+Python/notebook workers and rebuild/reload models so old traced functions are
+not reused. Execution flags are chosen when reconstructing a layer.
+
+Development snapshots can share the `0.5.2` version string while containing
+different execution fixes. A version comparison alone does not certify an
+unreleased snapshot. Install the updated source/package, restart workers and
+reconstruct models; record the eventual release commit for reproducibility.
+
 
 ## Quick starts
 
@@ -277,11 +291,11 @@ Compilation is opt-in:
 # PyTorch model or layer:
 model.compile(fullgraph=True, dynamic=False)
 
-# Keras training function:
-model.compile(optimizer="adam", loss="mse", jit_compile=True)
-
-# Alternatively, an individual TensorFlow operator:
+# TensorFlow: select static XLA chunks on each participating operator:
 layer = SuperONN2D(8, 3, padding="same", jit_compile=True)
+
+# A containing model built with those operators can also opt into XLA:
+model.compile(optimizer="adam", loss="mse", jit_compile=True)
 ```
 
 These are separate framework examples. Compilation has a first-call cost;
@@ -289,10 +303,22 @@ new shapes can trigger new compilations. Start with fixed shapes, verify outputs
 and gradients, and measure the actual workload. See
 [performance and troubleshooting](docs/PERFORMANCE.md) for setup and limitations.
 
+TensorFlow 0.5.2 reuses dynamically shaped recomputation functions and bounds
+non-XLA full-layout forward and backward chunk loops. The streaming backward
+recomputes one chunk at a time and avoids retained per-chunk tape buffers.
+Registered gradient closures use weak owner references so discarded layers
+can be collected.
+Bounded operator graphs do not guarantee low startup cost for every containing
+training graph. Layer XLA selects static chunks. PyTorch retains its native
+non-reentrant training checkpoint policy. For additive independent branches,
+see the [gradient-aggregation example](examples/tensorflow_branches.py).
+The library does not change global execution or optimizer settings.
+
 For TensorFlow losses that differentiate an input gradient, such as R1 or
 gradient penalties, use `recompute=False` in every participating operational
-layer or factory. TensorFlow's `tf.recompute_grad` supports first-order
-rematerialization and raises an error for these nested derivatives. The native
+layer or factory. Recomputed paths do not provide a supported higher-order
+gradient contract; TensorFlow's rematerialization helper can reject nested
+derivatives. The native
 path with recomputation disabled supports the tested input-gradient penalties;
 this choice uses more saved activation memory.
 
@@ -395,31 +421,32 @@ python examples/pytorch_training.py
 python examples/pytorch_training.py --compile
 python examples/tensorflow_training.py
 python examples/tensorflow_training.py --compile
+python examples/tensorflow_branches.py
 python examples/backend_interop.py
 ```
 
 - [Basic models](examples/basic_models.py): PyTorch generator, regressor, and discriminator.
 - [PyTorch training](examples/pytorch_training.py): AMP, regularization, optional compilation.
 - [TensorFlow training](examples/tensorflow_training.py): native Keras training and optional XLA.
+- [Independent branches](examples/tensorflow_branches.py): reusable branch graphs, one update and one regularizer.
 - [Layer transfer](examples/backend_interop.py): native image encoder/decoders and bidirectional transfer.
 
-The release tree contains library code, documentation, usage examples, and
-package checks. Development probes and regression scripts are maintained outside
-the distribution. GitHub Actions builds the source distribution and wheel,
-validates distribution metadata, and checks installed backend APIs from outside
-the source checkout. The workflow includes Linux PyTorch version jobs and
-Linux/Windows/macOS TensorFlow CPU jobs. Remote results become available when
-those jobs run.
+The repository and source distribution retain a compact [regression suite](tests/).
+It includes an independent scalar reference and separate optional backend suites;
+the installed runtime wheel contains only the library. GitHub Actions builds and
+checks distributions, checks installed APIs outside the checkout, and runs CPU
+regressions in the existing backend matrix. Remote CI results become available
+only after those jobs run.
 
-Local validation covers the convolution limits, grouping, sampling and gradient
-contracts, state transfer, mixed precision, and compilation. Additional lifecycle
-checks cover optimizer resume, functional/stateless calls, TensorFlow SavedModel
-serving, and PyTorch ExportedProgram save/load. These checks use Python 3.13.14,
-PyTorch 2.6.0/2.14.1, TensorFlow 2.21.0, and Keras 3.15.0/3.15.1. Lifecycle and
-deployment checks use Linux CPU; deferred PyTorch materialization also passes on
-CUDA. Synchronous CPU training and compiled Keras stateless calls were checked
-separately. Earlier numerical/compilation checks also cover
-the local CUDA device.
+The focused 0.5.2 checks cover all eight CPU cores with independent outputs and
+input/coefficient/shift gradients, recomputation on/off, state round trips,
+stateless/functional calls and mixed precision. TensorFlow CPU operator and
+whole-function XLA checks pass with layer XLA selected explicitly. PyTorch CUDA
+outputs/gradients/AMP pass on 2.6.0. TensorFlow CUDA is unavailable in the unchanged
+local environment; the PyTorch 2.14.1 CPU Inductor probe timed out during 2D after
+passing 1D. See the [verification scope and measurements](docs/PERFORMANCE.md#focused-052-verification)
+for versions, tolerances and limits. Earlier lifecycle/export/distributed checks
+remain historical evidence in the changelog.
 
 Task accuracy, multi-host/GPU distributed execution, ONNX export, and additional accelerators
 require their own validation. When reporting an issue, include a small
@@ -435,10 +462,24 @@ superonn/tensorflow/      Native Keras cores, compositions, and factories
 superonn/interop.py       Validated configuration/weight transfer
 examples/                 Runnable models and training loops
 docs/                     API, performance, and interoperability guides
-.github/workflows/        Distribution and installed-backend checks
+tests/                    Independent oracle, optional backend suites, bounded runner
+.github/workflows/        Distribution, installed-API and CPU regression checks
 pyproject.toml            Packaging and backend extras
 LICENSE / NOTICE.md       MIT license and research credits
 ```
+
+Run maintained development checks with the backend(s) you use:
+
+```bash
+python -m pip install -e ".[test,torch]"   # or .[test,tensorflow]
+python -B -m tests.run_checks base
+python -B -m tests.run_checks torch
+python -B -m tests.run_checks tensorflow
+```
+
+The `test` extra adds NumPy for the oracle; it is not a base runtime dependency.
+Optional compiler/device probes and resource limits are explained in the
+[performance guide](docs/PERFORMANCE.md#reproduce-the-focused-checks).
 
 Build distributions with isolated build dependencies:
 
