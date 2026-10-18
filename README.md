@@ -21,6 +21,8 @@ full/shared connectivity, configurable polynomial degree, and optional input
 bounding. TensorFlow also provides 1D depthwise/separable compositions and
 factories for switching between standard Keras convolutions and SuperONNs.
 
+**Disclaimer:** The PyTorch implementation is original, and naturally more efficient and supported compared to the TensorFlow implementation
+
 [Installation](#installation) · [Quick starts](#quick-starts) ·
 [Hyperparameters](#hyperparameters) · [Interoperability](#framework-interoperability) ·
 [API](docs/API.md) · [Performance](docs/PERFORMANCE.md) · [Citation](#research-and-citation)
