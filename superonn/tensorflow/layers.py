@@ -550,6 +550,9 @@ class SuperONN1D(tf.keras.layers.Layer):
         extent = (count - 1) * self.strides + effective_kernel
         position = tf.cast(tf.range(extent) - left, self.stable_dtype)
         conv_dtype = tf.as_dtype(self.compute_dtype) if self.conv_precision == "autocast" else self.stable_dtype
+        # Compute only retained output positions when native striding is safe.
+        # Simultaneous stride+dilation retains the backend-independent fallback.
+        native_stride = self.strides if self.dilation_rate == 1 else 1
         if self.groups == self.input_channels:
             # Depthwise polynomial filtering can process every original channel
             # in one native kernel. Q separate depthwise responses are summed
@@ -567,10 +570,14 @@ class SuperONN1D(tf.keras.layers.Layer):
             multiplier = self.filters_per_group
             weights = tf.reshape(kernel[:, 0, :, :], (self.kernel_size, self.orders, self.input_channels, multiplier))
             weights = tf.reshape(tf.transpose(weights, (0, 2, 1, 3)), (1, self.kernel_size, self.input_channels * self.orders, multiplier))
+            # The singleton height still has one VALID output at any stride.
+            # Equal spatial strides also satisfy the native CPU depthwise kernel.
             result = tf.nn.depthwise_conv2d(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
-                                          strides=(1, 1, 1, 1), padding="VALID", dilations=(1, self.dilation_rate), data_format="NHWC")
+                                          strides=(1, native_stride, native_stride, 1), padding="VALID", dilations=(1, self.dilation_rate), data_format="NHWC")
+            result = tf.squeeze(result, axis=1)
+            if native_stride != self.strides:
+                result = result[:, ::self.strides, :]
             result = tf.cast(result, self.stable_dtype)
-            result = tf.squeeze(result, axis=1)[:, ::self.strides, :]
             result = tf.reshape(result, (tf.shape(inputs)[0], count, self.input_channels, self.orders, multiplier))
             return tf.reshape(tf.reduce_sum(result, axis=3), (tf.shape(inputs)[0], count, self.filters))
         outputs = []
@@ -589,12 +596,11 @@ class SuperONN1D(tf.keras.layers.Layer):
             basis = tf.reshape(tf.stack(powers, axis=-1), (tf.shape(inputs)[0], extent, self.channels_per_group * self.orders))
             start, end = group * self.filters_per_group, (group + 1) * self.filters_per_group
             weights = tf.reshape(kernel[:, :, :, start:end], (self.kernel_size, self.channels_per_group * self.orders, self.filters_per_group))
-            # Compute unit stride then slice so simultaneous stride+dilation is
-            # defined without relying on a backend-specific convolution limit.
             result = tf.nn.convolution(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
-                                      padding="VALID", dilations=(self.dilation_rate,), data_format="NWC")
-            result = tf.cast(result, self.stable_dtype)
-            outputs.append(result[:, ::self.strides, :])
+                                      strides=(native_stride,), padding="VALID", dilations=(self.dilation_rate,), data_format="NWC")
+            if native_stride != self.strides:
+                result = result[:, ::self.strides, :]
+            outputs.append(tf.cast(result, self.stable_dtype))
         return tf.concat(outputs, axis=-1)
 
     def _full_chunk(self, inputs, kernel, shifts, positions, channels):

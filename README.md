@@ -303,6 +303,14 @@ new shapes can trigger new compilations. Start with fixed shapes, verify outputs
 and gradients, and measure the actual workload. See
 [performance and troubleshooting](docs/PERFORMANCE.md) for setup and limitations.
 
+TensorFlow compact forward 1D/2D paths use native convolution strides where
+portable, avoiding outputs that would be discarded during downsampling.
+Stride-plus-dilation and unequal 2D depthwise strides retain a unit-stride
+fallback; transpose layers retain unit-stride convolution on their sparse
+lattices. Fallback precision casts apply only to retained outputs. These changes
+preserve the selected operator settings; runtime and memory improvements have
+not been measured.
+
 TensorFlow 0.5.2 reuses dynamically shaped recomputation functions and bounds
 non-XLA full-layout forward and backward chunk loops. The streaming backward
 recomputes one chunk at a time and avoids retained per-chunk tape buffers.

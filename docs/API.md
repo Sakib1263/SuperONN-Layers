@@ -118,7 +118,7 @@ SuperONN1D(
 
 Keras-specific details:
 
-- `kernel_size`, `strides`, and `dilation_rate` accept scalar integers or tuples matching spatial rank. Both stride and dilation can exceed one; the shared path uses a unit-stride native convolution then slices the output.
+- `kernel_size`, `strides`, and `dilation_rate` accept scalar integers or tuples matching spatial rank. Compact forward 1D/2D paths use native convolution strides when dilation is one. Both stride and dilation may exceed one; these combinations retain a unit-stride convolution followed by output selection. Unequal 2D depthwise strides also use this portable fallback because CPU depthwise kernels require equal row/column strides. Transpose convolutions retain unit stride on their sparse lattices.
 - Forward padding is `"same"`, `"valid"`, or nonnegative symmetric per-axis integers. Boundaries are `"zeros"`, `"border"`, `"reflection"`, or `"circular"`. Transpose requires `boundary="zeros"`.
 - `initialization` accepts `"linear"` and `"all_orders"`. `shift_initializer` accepts `"zeros"` and `"random"`, with the same mode-dependent default as PyTorch.
 - `max_shift` is a finite nonnegative scalar or a per-axis 2D tuple. Fixed offsets are sampled from integer bins within `floor(max_shift)`. `seed` optionally seeds offset initialization; use ordinary Keras random-seed controls for the whole model.

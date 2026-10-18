@@ -2,6 +2,24 @@
 
 ## 0.5.2 — Unreleased
 
+- Extended native forward striding to TensorFlow 2D compact paths for ordinary,
+  grouped and equal-stride depthwise convolution with unit dilation. Preserved
+  sparse-lattice transpose behavior and portable stride/dilation and unequal
+  depthwise-stride fallbacks.
+- Cast only selected fallback convolution outputs back to the stable dtype in
+  TensorFlow 1D/2D; sampling, polynomial and convolution precision policies stay
+  unchanged.
+- Added focused 2D oracle/all-gradient, native-output-count, exact-boundary,
+  dynamic/stateless/frozen-input, wrapper/factory/update, mixed-policy fallback,
+  nested-derivative, CPU XLA and bidirectional conversion regressions. No runtime
+  or memory speedup was measured. Kept the existing chunked/streamed/weak-owner
+  implementations and native PyTorch source unchanged.
+
+- Compute shared/depthwise 1D downsampling with native convolution strides when
+  dilation is one, instead of computing and discarding intervening outputs.
+  Keep the stride-plus-dilation fallback, output geometry, coefficients/offsets
+  and checkpoint layouts unchanged. Focused CPU checks cover legacy/oracle
+  outputs and gradients, dynamic layouts/padding and native output counts.
 - Isolated TensorFlow recomputation inside reusable, dynamically shaped chunk
   functions, bounding the localized custom-gradient dependency walk rather
   than replicating it for each chunk in a caller's training graph.

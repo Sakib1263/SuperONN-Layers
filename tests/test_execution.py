@@ -223,6 +223,37 @@ class TensorFlowExecutionTests(unittest.TestCase):
         self.assertTrue(any(np.any(a != v.numpy()) for a, v in zip(before, model.trainable_variables)))
 
 
+
+    @unittest.skipUnless(COMPILER, "changed compact-stride XLA explicitly opt-in")
+    def test_xla_compact_2d_strides(self):
+        import tensorflow as tf
+        from .test_tensorflow import make, assign, tensor
+        for groups, channels, outputs in ((1, 2, 3), (2, 4, 6), (2, 2, 4)):
+            case = Case(2, False, "shared")
+            case.groups, case.channels, case.outputs = groups, channels, outputs
+            case.dilation, case.stride = (1, 1), (2, 2)
+            arrays = case.data()
+            layer = make(case, dtype="float32", jit=True)
+            ordinary = make(case, dtype="float32", recompute=False)
+            assign(layer, arrays)
+            assign(ordinary, arrays)
+            x = tf.constant(tensor(arrays[0]), tf.float32)
+            def evaluate(core):
+                with tf.GradientTape() as tape:
+                    tape.watch(x)
+                    y = core(x)
+                    loss = tf.reduce_sum(y ** 2)
+                return y, tape.gradient(loss, (x, *core.trainable_variables))
+            expected, wanted = evaluate(ordinary)
+            actual, gradients = evaluate(layer)
+            np.testing.assert_allclose(np.moveaxis(np.asarray(actual), -1, 1), forward(case, *arrays), rtol=3e-5, atol=3e-6)
+            np.testing.assert_allclose(actual, expected, rtol=3e-5, atol=3e-6)
+            for got, reference in zip(gradients, wanted):
+                self.assertIsNotNone(got)
+                np.testing.assert_allclose(got, reference, rtol=2e-4, atol=3e-6)
+            report(backend="tensorflow", device=DEVICE, rank=2, groups=groups,
+                   channels=channels, compiler="XLA", compact_strides="passed")
+
 @unittest.skipUnless(BACKEND == "torch", "opt-in PyTorch process")
 class TorchExecutionTests(unittest.TestCase):
     def test_full_chunk_profile(self):

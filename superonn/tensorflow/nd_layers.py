@@ -286,10 +286,16 @@ class _SuperONNND(tf.keras.layers.Layer):
 
     def _shared(self, inputs, kernel, shifts, counts, origins, effective):
         steps = (1,) * self.spatial_rank if self.transposed else self.strides
+        # Native forward strides avoid computing positions discarded below.
+        # Keep simultaneous stride/dilation portable, including CPU gradients.
+        native_steps = steps if all(d == 1 for d in self.dilation_rate) else (1,) * self.spatial_rank
         extents = (counts - 1) * tf.constant(steps, tf.int32) + tf.constant(effective, tf.int32)
         positions = position_grid(extents, (1,) * self.spatial_rank, origins, self.stable_dtype)
         conv_dtype = tf.as_dtype(self.compute_dtype) if self.conv_precision == "autocast" else self.stable_dtype
         if self.spatial_rank == 2 and self.groups == self.input_channels:
+            # CPU depthwise kernels require equal row/column strides.
+            if native_steps[0] != native_steps[1]:
+                native_steps = (1, 1)
             channels = tf.range(self.input_channels)
             coords = positions[:, None, None, :] + tf.reshape(shifts, (1, 1, self.input_channels, 2))
             sampled = sample_nd(inputs, coords, channels, self.boundary, 2)[:, :, 0]
@@ -304,8 +310,10 @@ class _SuperONNND(tf.keras.layers.Layer):
             weights = tf.reshape(kernel[..., 0, :, :], (*self.kernel_size, self.orders, self.input_channels, multiplier))
             weights = tf.reshape(tf.transpose(weights, (0, 1, 3, 2, 4)), (*self.kernel_size, self.input_channels * self.orders, multiplier))
             result = tf.nn.depthwise_conv2d(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
-                                           strides=(1, 1, 1, 1), padding="VALID", dilations=self.dilation_rate, data_format="NHWC")
-            result = tf.cast(result[:, ::steps[0], ::steps[1]], self.stable_dtype)
+                                           strides=(1, *native_steps, 1), padding="VALID", dilations=self.dilation_rate, data_format="NHWC")
+            if native_steps != steps:
+                result = result[:, ::steps[0], ::steps[1], :]
+            result = tf.cast(result, self.stable_dtype)
             result = tf.reshape(result, tf.concat(([tf.shape(inputs)[0]], counts, [self.input_channels, self.orders, multiplier]), 0))
             return tf.reshape(tf.reduce_sum(result, axis=-2), tf.concat(([tf.shape(inputs)[0]], counts, [self.filters]), 0))
         outputs = []
@@ -325,12 +333,13 @@ class _SuperONNND(tf.keras.layers.Layer):
             # The rank-agnostic API implements portable dilated gradients using
             # space-to-batch where direct CPU Conv2D backprop lacks support.
             result = tf.nn.convolution(tf.cast(basis, conv_dtype), tf.cast(weights, conv_dtype),
-                                       padding="VALID", dilations=self.dilation_rate,
+                                       strides=native_steps, padding="VALID", dilations=self.dilation_rate,
                                        data_format="NWC" if self.spatial_rank == 1 else "NHWC")
-            if self.spatial_rank == 1:
-                result = result[:, ::steps[0], :]
-            else:
-                result = result[:, ::steps[0], ::steps[1], :]
+            if native_steps != steps:
+                if self.spatial_rank == 1:
+                    result = result[:, ::steps[0], :]
+                else:
+                    result = result[:, ::steps[0], ::steps[1], :]
             outputs.append(tf.cast(result, self.stable_dtype))
         return tf.concat(outputs, axis=-1)
 

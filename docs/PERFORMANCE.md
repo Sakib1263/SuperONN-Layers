@@ -25,6 +25,20 @@ Compatible batch/spatial sizes and smaller final chunks share signatures.
 Non-XLA full-layout execution uses one sequential runtime chunk loop per group.
 Shared/depthwise paths retain their native convolution implementations.
 
+Compact forward 1D/2D paths request the retained output positions directly
+through native convolution strides when dilation is one. This also applies to
+full layouts that are structurally equivalent: one output per group, or all
+configured shift bounds zero. A learned full layout is never treated as shared
+merely because its current offset values are zero.
+
+The extended sampled source grid, padding origins and output counts are
+unchanged. Simultaneous stride/dilation retains unit-stride convolution and
+output selection. Two-dimensional depthwise kernels also retain that fallback
+for unequal row/column strides, respecting CPU restrictions. Transpose layers
+continue to use unit stride on the sparse input lattice. Casts back to the
+stable dtype occur after fallback selection, preserving native convolution
+precision while avoiding casts of discarded positions.
+
 A custom gradient surrounds the complete full-layout loop, but its backward
 recomputes and differentiates **one chunk at a time**. It accumulates a common
 input-gradient buffer and assembles coefficient/offset gradients in their
@@ -121,6 +135,46 @@ directions and gradients for all four operator pairs.
 Older lifecycle/export/distributed evidence is recorded in the changelog.
 It does not extend the new execution checks to unexecuted devices or compilers.
 
+### Forward-stride audit and focused follow-up
+
+The 2026-10-18 source review distinguished existing optimizations from the
+remaining 2D gap:
+
+| Path | Baseline | Action |
+|---|---|---|
+| TensorFlow 1D compact forward | Native strides already present in the working tree | Retained and checked; moved fallback result casts after output selection |
+| TensorFlow 2D compact forward | Unit-stride convolution followed by slicing | Added native strides where portable |
+| TensorFlow stride/dilation and unequal 2D depthwise strides | Portable unit-stride fallback | Retained; precision casts only cover selected outputs |
+| TensorFlow transpose 1D/2D | Sparse lattice, flipped kernels, scaled offsets, unit-stride convolution | Retained |
+| TensorFlow full-layout recomputation | Sequential chunks, streamed chunk VJPs, weak owner references, Horner evaluation | Retained |
+| PyTorch four cores | Native forward strides, compact dispatch, bounded full-layout Horner and non-reentrant checkpoints | No source changes |
+
+The missing checks were native 2D output counts and compact-path derivative,
+state, factory, precision and conversion coverage. Maintained tests now compare
+both the former dense-convolution/slice computation and the independent scalar
+oracle. They cover input, coefficient, offset and bias gradients, including
+finite differences away from interpolation kinks, plus separate exact-edge
+boundary checks. Cases include ordinary/grouped/shared/depthwise layouts,
+structural zero bounds, short/odd inputs, constant bases, transpose controls,
+recomputation on/off, FP32 and mixed FP16/BF16 policies, both convolution
+precision policies, dynamic shapes, mutated/stateless weights, frozen input
+gradients, nested derivatives without recomputation, regularizer accounting,
+factories/wrappers and save/load.
+
+On Python **3.13.14**, TensorFlow **2.21.0**, Keras **3.15.0** and NumPy **2.5.1**,
+the focused CPU checks passed. Changed-path CPU XLA checks passed for ordinary,
+grouped and depthwise 2D native strides, including all first-order gradients.
+PyTorch **2.6.0+cu126** conversion checks passed for those same compact 2D paths
+in both directions. Existing expensive Inductor/CUDA matrices were not repeated.
+TensorFlow CUDA remains unavailable in this runtime; Windows/macOS were not
+executed locally for this follow-up.
+
+A native-output-count regression demonstrates a 2D ordinary/grouped case
+producing **3 by 3** retained convolution positions instead of **5 by 7** dense
+positions, with identical mathematical settings. This is an operation-count
+diagnostic. **Runtime and memory improvements were not measured**; test runner
+RSS reports are process limits, not comparative activation-memory measurements.
+
 ### CPU Inductor follow-up
 
 The 2026-10-18 follow-up uses `backend="inductor"`, `fullgraph=True` and
@@ -205,6 +259,25 @@ python -B -m tests.run_checks base
 python -B -m tests.run_checks torch
 python -B -m tests.run_checks tensorflow
 python -B -m tests.run_checks interop         # requires both
+```
+
+Run only the focused stride checks and affected contracts for this update:
+
+```bash
+CUDA_VISIBLE_DEVICES=-1 OMP_NUM_THREADS=2 TF_NUM_INTRAOP_THREADS=2 TF_NUM_INTEROP_THREADS=2 \
+python -B -m tests.run_checks tensorflow --seconds 240 \
+  --test tests.test_tensorflow.TensorFlowSharedStrideTests \
+  --test tests.test_tensorflow.TensorFlowNDStrideTests \
+  --test tests.test_tensorflow.TensorFlowCoreTests.test_shared_dynamic_and_instance_lifetime
+
+CUDA_VISIBLE_DEVICES=-1 SUPERONN_PROBE_BACKEND=tensorflow SUPERONN_RUN_COMPILER=1 \
+TF_NUM_INTRAOP_THREADS=2 TF_NUM_INTEROP_THREADS=2 OMP_NUM_THREADS=2 \
+python -B -m tests.run_checks execution --seconds 180 \
+  --test tests.test_execution.TensorFlowExecutionTests.test_xla_compact_2d_strides
+
+CUDA_VISIBLE_DEVICES=-1 OMP_NUM_THREADS=2 TF_NUM_INTRAOP_THREADS=2 TF_NUM_INTEROP_THREADS=2 \
+python -B -m tests.run_checks interop --seconds 120 \
+  --test tests.test_interop.InteropTests.test_strided_compact_2d_round_trip
 ```
 
 The runner bounds child wall time (180 s by default) and samples process-tree
